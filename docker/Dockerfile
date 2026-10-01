@@ -35,7 +35,7 @@ RUN chmod 755 /usr/local/bin/uwusync-server \
 # cc-debian13 is trixie, so its glibc matches the build. The server opens one
 # port above 1024 and writes one directory, so it needs no capability at all
 # and no root.
-FROM gcr.io/distroless/cc-debian13@sha256:4594d59540d1948417f6ca2829ddd9294493a7c68b7528f4dd459de7f203a750
+FROM gcr.io/distroless/cc-debian13@sha256:159783207c2cd44c2aa5715961d13c8612368ac9bd450f887e3f08fc8ea461e3
 COPY --from=prep /usr/local/bin/ /usr/local/bin/
 COPY --from=prep --chown=10001:10001 /data /data
 USER 10001:10001
