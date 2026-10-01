@@ -12,7 +12,9 @@
 //!
 //! The wire format, the clock and the conflict rule come from `uwussh-proto`,
 //! the same crate the client uses. That is deliberate: a schema change is one
-//! edit in one place instead of two that drift apart.
+//! edit in one place instead of two that drift apart. The one exception is the
+//! record kind, which [`wire`] takes as any name: a kind the clients add needs
+//! no new server.
 
 pub mod api;
 pub mod auth;
@@ -26,6 +28,7 @@ pub mod pairing;
 pub mod state;
 pub mod tls;
 pub mod updates;
+pub mod wire;
 
 pub use config::Config;
 pub use error::{ApiError, Result};

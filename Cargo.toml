@@ -1,7 +1,7 @@
 [package]
 name = "uwusync-server"
 description = "Sync server for UwUSSH and UwURDP: an encrypted mailbox for hosts, keys and passwords"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/MinifyX/UwUSync-Server"
