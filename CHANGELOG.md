@@ -3,6 +3,23 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
+## 0.2.2
+
+**The command assistant's records, for UwUSSH 0.3.** UwUSSH 0.3 syncs the settings of its command
+assistant and its cache of answers as two new kinds of record (`assist_config` and
+`assist_cache`). The server stores them like any other record. Before, it refused a push that held
+a kind it did not know.
+
+- **Old clients are not sent them.** UwUSSH 0.2 cannot read a page that holds a kind it has never
+  heard of, so the assistant's records only go to clients that ask for them (`assist=1`). The
+  others are passed over, and the cursor still moves past them, so an older client keeps syncing
+  everything else and never gets stuck in front of them.
+- **New kinds need no new server.** A record's kind is now any short lowercase name, kept as it
+  came. Kinds the server does not know yet go to the same clients as the assistant's: those skip a
+  kind they cannot read instead of failing the page.
+- A conflict hands a record back under its own kind. Before, a kind the server could not name came
+  back as a host.
+
 ## 0.2.1
 
 **Security fixes.** A third look, this time at 0.2.0, found four more ways to wear the server down

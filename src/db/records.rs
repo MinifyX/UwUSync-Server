@@ -11,13 +11,11 @@
 //! record it has not seen is simply new to it.
 
 use crate::db::accounts::Account;
+use crate::wire::{Envelope, Kind, PullResponse, PushResponse, Reader};
 use crate::{now_ms, ApiError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
-use uwussh_proto::{
-    Accepted, EntityKind, Envelope, PullResponse, PushResponse, SyncCursor, MAX_BATCH,
-    MAX_BATCH_BYTES, MAX_BLOB_BYTES,
-};
+use uwussh_proto::{Accepted, SyncCursor, MAX_BATCH, MAX_BATCH_BYTES, MAX_BLOB_BYTES};
 
 /// What one account may hold. A vault of hosts, keys and snippets is a few
 /// megabytes; this is room for a hundred times that, and still means one
@@ -46,17 +44,6 @@ impl Default for Quota {
 
 /// An XChaCha20-Poly1305 nonce, as every envelope carries.
 const NONCE_BYTES: usize = 24;
-
-fn kind_name(kind: EntityKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn kind_from(name: &str) -> Option<EntityKind> {
-    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
-}
 
 /// Everything about an envelope the server can check without a key: that it
 /// belongs to this account's vault, that it is shaped like an envelope, and
@@ -177,7 +164,7 @@ pub fn push_within(
             params![
                 account.id.to_string(),
                 envelope.id.to_string(),
-                kind_name(envelope.kind),
+                envelope.kind.as_str(),
                 seq,
                 envelope.updated_at.wall_ms as i64,
                 envelope.updated_at.counter,
@@ -244,15 +231,18 @@ pub fn push_within(
 /// would be 128 MiB in memory for one request, and a few of those at once
 /// take down a small machine.
 ///
-/// `manifests` says whether the device reads manifests. For one that doesn't,
-/// they are passed over — the cursor still moves past them, so it never asks
-/// for them again.
+/// `reader` says which kinds the device can read (see [`Kind::readable_by`]).
+/// The others are passed over without counting towards the page, and the
+/// cursor still moves past them — also when that leaves the page empty — so
+/// a device that stores the cursor never asks for them again, and one that
+/// does not is only handed the same empty page until something it reads
+/// comes along.
 pub fn pull(
     conn: &Connection,
     account: &Account,
     since: u64,
     limit: usize,
-    manifests: bool,
+    reader: Reader,
 ) -> Result<PullResponse> {
     let limit = limit.clamp(1, MAX_BATCH);
     // No LIMIT in SQL: rows passed over don't count towards the page, and the
@@ -272,7 +262,7 @@ pub fn pull(
     let mut cursor = since;
     for row in rows {
         let envelope = row?;
-        if !manifests && envelope.kind == EntityKind::Manifest {
+        if !envelope.kind.readable_by(reader) {
             cursor = envelope.seq.unwrap_or(cursor).max(cursor);
             continue;
         }
@@ -308,7 +298,7 @@ pub fn get(conn: &Connection, account: &Account, id: Uuid) -> Result<Option<Enve
 
 fn row_to_envelope(account: &Account, row: &rusqlite::Row<'_>) -> rusqlite::Result<Envelope> {
     let id: String = row.get(0)?;
-    let kind: String = row.get(1)?;
+    let kind = Kind::stored(row.get(1)?);
     let seq: i64 = row.get(2)?;
     let wall: i64 = row.get(3)?;
     let counter: i64 = row.get(4)?;
@@ -316,7 +306,7 @@ fn row_to_envelope(account: &Account, row: &rusqlite::Row<'_>) -> rusqlite::Resu
     Ok(Envelope {
         id: Uuid::parse_str(&id).unwrap_or(Uuid::nil()),
         vault_id: account.vault_id,
-        kind: kind_from(&kind).unwrap_or(EntityKind::Host),
+        kind,
         updated_at: uwussh_proto::Hlc::new(wall as u64, counter as u32, device as u32),
         base_seq: seq as u64,
         deleted: row.get(6)?,
@@ -384,7 +374,7 @@ pub fn drop_manifests_of(
     let which = params![
         account_id.to_string(),
         device_id.to_string(),
-        kind_name(EntityKind::Manifest)
+        Kind::MANIFEST
     ];
     let (count, bytes): (i64, i64) = tx.query_row(
         "SELECT count(*), coalesce(sum(length(blob)), 0) FROM records
@@ -419,7 +409,7 @@ pub fn usage(conn: &Connection, account: &Account) -> rusqlite::Result<(u64, u64
 pub(crate) mod tests {
     use super::*;
     use crate::db::{accounts, Db};
-    use uwussh_proto::Hlc;
+    use uwussh_proto::{EntityKind, Hlc};
 
     fn account(conn: &Connection) -> Account {
         accounts::create(conn, &accounts::tests::header(), b"key").unwrap()
@@ -456,13 +446,13 @@ pub(crate) mod tests {
             push_within(&mut conn, &account, device, &batch[5..], Quota::default()).unwrap();
         }
 
-        let first = pull(&conn, &account, 0, MAX_BATCH, true).unwrap();
+        let first = pull(&conn, &account, 0, MAX_BATCH, Reader::ALL).unwrap();
         let bytes: usize = first.envelopes.iter().map(|env| env.blob.len()).sum();
         assert!(bytes <= MAX_BATCH_BYTES, "{bytes}");
         assert_eq!(first.envelopes.len(), MAX_BATCH_BYTES / MAX_BLOB_BYTES);
         assert!(first.has_more);
 
-        let second = pull(&conn, &account, first.cursor.0, MAX_BATCH, true).unwrap();
+        let second = pull(&conn, &account, first.cursor.0, MAX_BATCH, Reader::ALL).unwrap();
         assert_eq!(first.envelopes.len() + second.envelopes.len(), 40);
         assert!(!second.has_more);
     }
@@ -581,7 +571,7 @@ pub(crate) mod tests {
         Envelope {
             id,
             vault_id: account.vault_id,
-            kind: EntityKind::Host,
+            kind: EntityKind::Host.into(),
             updated_at: Hlc::new(1_700_000_000_000, 0, 1),
             base_seq,
             deleted: false,
@@ -605,7 +595,7 @@ pub(crate) mod tests {
         assert!(response.conflicts.is_empty());
         assert_eq!(response.cursor, SyncCursor(1));
 
-        let page = pull(&conn, &account, 0, 10, true).unwrap();
+        let page = pull(&conn, &account, 0, 10, Reader::ALL).unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert_eq!(page.envelopes[0].id, id);
         assert_eq!(page.envelopes[0].seq, Some(1));
@@ -615,7 +605,7 @@ pub(crate) mod tests {
         assert_eq!(page.cursor, SyncCursor(1));
 
         // And nothing comes twice.
-        let again = pull(&conn, &account, 1, 10, true).unwrap();
+        let again = pull(&conn, &account, 1, 10, Reader::ALL).unwrap();
         assert!(again.envelopes.is_empty());
         assert_eq!(again.cursor, SyncCursor(1));
     }
@@ -700,16 +690,16 @@ pub(crate) mod tests {
             .unwrap();
         }
 
-        let page = pull(&conn, &account, 0, 2, true).unwrap();
+        let page = pull(&conn, &account, 0, 2, Reader::ALL).unwrap();
         assert_eq!(page.envelopes.len(), 2);
         assert!(page.has_more);
         assert_eq!(page.cursor, SyncCursor(2));
 
-        let page = pull(&conn, &account, page.cursor.0, 2, true).unwrap();
+        let page = pull(&conn, &account, page.cursor.0, 2, Reader::ALL).unwrap();
         assert_eq!(page.envelopes.len(), 2);
         assert!(page.has_more);
 
-        let page = pull(&conn, &account, page.cursor.0, 2, true).unwrap();
+        let page = pull(&conn, &account, page.cursor.0, 2, Reader::ALL).unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert!(!page.has_more, "the last page says so");
     }
@@ -729,7 +719,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert!(pull(&conn, &mine, 0, 10, true)
+        assert!(pull(&conn, &mine, 0, 10, Reader::ALL)
             .unwrap()
             .envelopes
             .is_empty());
@@ -834,27 +824,9 @@ pub(crate) mod tests {
         assert_eq!(count(&conn, &account).unwrap(), 0);
     }
 
-    #[test]
-    fn every_kind_survives_the_round_trip_through_the_database() {
-        for kind in [
-            EntityKind::Host,
-            EntityKind::Group,
-            EntityKind::Identity,
-            EntityKind::Key,
-            EntityKind::Snippet,
-            EntityKind::PortForward,
-            EntityKind::KnownHost,
-            EntityKind::TerminalProfile,
-            EntityKind::Secret,
-            EntityKind::Manifest,
-        ] {
-            assert_eq!(kind_from(&kind_name(kind)), Some(kind), "{kind:?}");
-        }
-    }
-
     fn manifest(account: &Account) -> Envelope {
         Envelope {
-            kind: EntityKind::Manifest,
+            kind: EntityKind::Manifest.into(),
             ..envelope(account, Uuid::now_v7(), 0)
         }
     }
@@ -874,17 +846,17 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let old = pull(&conn, &account, 0, 10, false).unwrap();
+        let old = pull(&conn, &account, 0, 10, Reader::default()).unwrap();
         assert_eq!(old.envelopes.len(), 1);
         assert_eq!(old.envelopes[0].id, host.id);
         assert_eq!(old.cursor.0, 3, "the cursor moves past the manifests too");
         assert!(!old.has_more);
 
-        let new = pull(&conn, &account, 0, 10, true).unwrap();
+        let new = pull(&conn, &account, 0, 10, Reader::ALL).unwrap();
         assert_eq!(new.envelopes.len(), 3);
 
         // A page of nothing but manifests is an empty page for the old one.
-        let rest = pull(&conn, &account, 2, 10, false).unwrap();
+        let rest = pull(&conn, &account, 2, 10, Reader::default()).unwrap();
         assert!(rest.envelopes.is_empty());
     }
 
@@ -899,10 +871,10 @@ pub(crate) mod tests {
         batch.push(envelope(&account, Uuid::now_v7(), 0));
         push(&mut conn, &account, device, &batch).unwrap();
 
-        let page = pull(&conn, &account, 0, 1, false).unwrap();
+        let page = pull(&conn, &account, 0, 1, Reader::default()).unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert!(page.has_more);
-        let page = pull(&conn, &account, page.cursor.0, 1, false).unwrap();
+        let page = pull(&conn, &account, page.cursor.0, 1, Reader::default()).unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert!(!page.has_more);
     }
@@ -924,12 +896,161 @@ pub(crate) mod tests {
         push(&mut conn, &account, stays, &[manifest(&account)]).unwrap();
 
         assert_eq!(drop_manifests_of(&conn, account.id, gone).unwrap(), 1);
-        let left = pull(&conn, &account, 0, 10, true).unwrap();
+        let left = pull(&conn, &account, 0, 10, Reader::ALL).unwrap();
         assert_eq!(
             left.envelopes.len(),
             2,
             "its host and the other device's manifest"
         );
         assert_eq!(usage(&conn, &account).unwrap().0, 2);
+    }
+
+    fn of_kind(account: &Account, kind: &str) -> Envelope {
+        Envelope {
+            kind: Kind::parse(kind).unwrap(),
+            ..envelope(account, Uuid::now_v7(), 0)
+        }
+    }
+
+    /// What UwUSSH 0.2 asks with: manifests, and no assistant.
+    const OLD: Reader = Reader {
+        manifests: true,
+        assist: false,
+    };
+
+    fn kinds(page: &PullResponse) -> Vec<&str> {
+        page.envelopes.iter().map(|env| env.kind.as_str()).collect()
+    }
+
+    #[test]
+    fn the_assistants_records_are_kept_and_go_only_to_clients_that_ask() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        let batch = [
+            of_kind(&account, "host"),
+            of_kind(&account, Kind::ASSIST_CONFIG),
+            of_kind(&account, Kind::ASSIST_CACHE),
+            of_kind(&account, "manifest"),
+            of_kind(&account, Kind::ASSIST_CACHE),
+            of_kind(&account, "key"),
+        ];
+        let pushed = push(&mut conn, &account, device, &batch).unwrap();
+        assert_eq!(pushed.accepted.len(), 6);
+        assert_eq!(count(&conn, &account).unwrap(), 6);
+
+        let old = pull(&conn, &account, 0, 10, OLD).unwrap();
+        assert_eq!(kinds(&old), ["host", "manifest", "key"]);
+        assert_eq!(old.cursor.0, 6);
+        assert!(!old.has_more);
+
+        let new = pull(&conn, &account, 0, 10, Reader::ALL).unwrap();
+        assert_eq!(
+            kinds(&new),
+            batch
+                .iter()
+                .map(|env| env.kind.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(new.envelopes[1], {
+            let mut stored = batch[1].clone();
+            stored.seq = Some(2);
+            stored.base_seq = 2;
+            stored
+        });
+        assert_eq!(new.cursor.0, 6);
+    }
+
+    #[test]
+    fn a_page_of_nothing_an_old_client_reads_still_moves_its_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        let host = of_kind(&account, "host");
+        push(&mut conn, &account, device, std::slice::from_ref(&host)).unwrap();
+        let cache: Vec<Envelope> = (0..4)
+            .map(|_| of_kind(&account, Kind::ASSIST_CACHE))
+            .collect();
+        push(&mut conn, &account, device, &cache).unwrap();
+
+        // Rows passed over are passed over even behind a full page: the
+        // cursor goes past them right away.
+        let first = pull(&conn, &account, 0, 1, OLD).unwrap();
+        assert_eq!(kinds(&first), ["host"]);
+        assert_eq!(first.cursor.0, 5);
+        assert!(!first.has_more);
+
+        // A device that had the host before the slots came: an empty page,
+        // a cursor at the end, and nothing more — not the same page again
+        // and again.
+        let second = pull(&conn, &account, 1, 1, OLD).unwrap();
+        assert!(second.envelopes.is_empty());
+        assert_eq!(second.cursor.0, 5);
+        assert!(!second.has_more);
+        let third = pull(&conn, &account, second.cursor.0, 1, OLD).unwrap();
+        assert!(third.envelopes.is_empty());
+        assert_eq!(third.cursor.0, 5);
+
+        // With one more host behind the slots, the full page says so, and
+        // the next one starts after the slots.
+        let later = of_kind(&account, "snippet");
+        push(&mut conn, &account, device, std::slice::from_ref(&later)).unwrap();
+        let full = pull(&conn, &account, 0, 1, OLD).unwrap();
+        assert_eq!(kinds(&full), ["host"]);
+        assert!(full.has_more);
+        assert_eq!(full.cursor.0, 5);
+        let next = pull(&conn, &account, full.cursor.0, 1, OLD).unwrap();
+        assert_eq!(kinds(&next), ["snippet"]);
+        assert!(!next.has_more);
+
+        // UwUSSH 0.2 does not store the cursor of an empty page. It asks from
+        // 1 again, and the next host still reaches it, past the slots.
+        let again = pull(&conn, &account, first.cursor.0, 1, OLD).unwrap();
+        assert_eq!(kinds(&again), ["snippet"]);
+        assert_eq!(again.cursor.0, 6);
+        assert!(!again.has_more);
+
+        // A new client pages through every one of them.
+        let mut cursor = 0;
+        let mut seen = Vec::new();
+        loop {
+            let page = pull(&conn, &account, cursor, 2, Reader::ALL).unwrap();
+            assert!(page.cursor.0 > cursor || page.envelopes.is_empty());
+            cursor = page.cursor.0;
+            seen.extend(page.envelopes.into_iter().map(|env| env.id));
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 6);
+        assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn a_kind_nobody_has_heard_of_yet_is_stored_as_it_came() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        let future = of_kind(&account, "hologram");
+        push(&mut conn, &account, device, std::slice::from_ref(&future)).unwrap();
+
+        assert!(pull(&conn, &account, 0, 10, OLD)
+            .unwrap()
+            .envelopes
+            .is_empty());
+        let page = pull(&conn, &account, 0, 10, Reader::ALL).unwrap();
+        assert_eq!(kinds(&page), ["hologram"]);
+
+        // A conflict hands it back under its own kind too.
+        let stale = Envelope {
+            blob: vec![5; 8],
+            ..future.clone()
+        };
+        let response = push(&mut conn, &account, device, &[stale]).unwrap();
+        assert_eq!(response.conflicts.len(), 1);
+        assert_eq!(response.conflicts[0].kind.as_str(), "hologram");
     }
 }

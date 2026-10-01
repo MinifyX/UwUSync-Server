@@ -5,6 +5,7 @@ use crate::connections::Holding;
 use crate::db::{devices, records};
 use crate::limits;
 use crate::state::AppState;
+use crate::wire::{PushRequest, PushResponse, Reader};
 use crate::{ApiError, Result};
 use axum::body::Body;
 use axum::extract::{Query, Request, State};
@@ -17,7 +18,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_stream::wrappers::ReceiverStream;
-use uwussh_proto::{PushRequest, PushResponse, MAX_BATCH, SCHEMA_VERSION};
+use uwussh_proto::{MAX_BATCH, SCHEMA_VERSION};
 
 #[derive(Debug, Deserialize)]
 pub struct PullQuery {
@@ -30,6 +31,21 @@ pub struct PullQuery {
     /// Clients send `manifests=1`.
     #[serde(default)]
     pub manifests: u8,
+    /// Set by clients that know the command assistant's kinds (UwUSSH 0.3).
+    /// Those also skip a kind they have never heard of, so they get every
+    /// kind there is; anyone else gets none of the assistant's. Clients send
+    /// `assist=1`.
+    #[serde(default)]
+    pub assist: u8,
+}
+
+impl PullQuery {
+    fn reader(&self) -> Reader {
+        Reader {
+            manifests: self.manifests != 0,
+            assist: self.assist != 0,
+        }
+    }
 }
 
 /// Everything after a cursor. The device's own records come back too — it
@@ -49,13 +65,7 @@ pub async fn pull(
     let limit = query.limit.unwrap_or(MAX_BATCH).min(MAX_BATCH);
     let page = {
         let conn = state.db.lock();
-        let page = records::pull(
-            &conn,
-            &auth.account,
-            query.since,
-            limit,
-            query.manifests != 0,
-        )?;
+        let page = records::pull(&conn, &auth.account, query.since, limit, query.reader())?;
         // How far this device has read decides what the server may forget —
         // so never further than there is: a device with a cursor from another
         // server, or from before a restore, must not let tombstones go it
@@ -104,7 +114,9 @@ pub async fn push(
 const RECHECK: Duration = Duration::from_secs(30);
 
 /// "There is something new from sequence N." Nothing else is ever pushed out:
-/// the device pulls, the same way it would have anyway.
+/// the device pulls, the same way it would have anyway. The event names no
+/// kind, so it needs no filtering: a device woken for records it does not
+/// read pulls a page without them, and the cursor still moves past them.
 ///
 /// A stream lasts as long as the token it was opened with. Every half minute
 /// it asks whether that token is still good, and ends when it is not — a
@@ -246,6 +258,7 @@ mod tests {
                 since: 0,
                 limit: None,
                 manifests: 1,
+                assist: 1,
             };
             pull(auth, State(state.clone()), Query(query))
         };
@@ -265,5 +278,102 @@ mod tests {
         assert!(matches!(ask().await, Err(ApiError::RateLimited)));
         drop(another);
         assert!(ask().await.is_ok());
+    }
+
+    /// A push as a client sends it, with a record of each kind named.
+    async fn push_kinds(state: &AppState, headers: &HeaderMap, kinds: &[&str]) -> Response {
+        let auth = authenticate(state, headers).unwrap();
+        let envelopes: Vec<serde_json::Value> = kinds
+            .iter()
+            .map(|kind| {
+                serde_json::json!({
+                    "id": uuid::Uuid::now_v7(),
+                    "vault_id": auth.account.vault_id,
+                    "kind": kind,
+                    "updated_at": uwussh_proto::Hlc::new(1_700_000_000_000, 0, 1),
+                    // 24 bytes of nonce, three of sealed record.
+                    "nonce": "A".repeat(32),
+                    "blob": "AQID",
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "schema": SCHEMA_VERSION, "envelopes": envelopes });
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        match push(auth, State(state.clone()), request).await {
+            Ok(answer) => answer.into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    async fn pull_as(state: &AppState, headers: &HeaderMap, since: u64, assist: u8) -> Vec<u8> {
+        let auth = authenticate(state, headers).unwrap();
+        let query = PullQuery {
+            since,
+            limit: None,
+            manifests: 1,
+            assist,
+        };
+        let body = pull(auth, State(state.clone()), Query(query))
+            .await
+            .unwrap()
+            .into_body();
+        axum::body::to_bytes(body, usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_assistants_kinds_are_taken_and_held_back_from_old_clients() {
+        let state = AppState::new(Db::open_in_memory().unwrap(), Config::default());
+        let (_, headers) = signed_in(&state);
+        let answer = push_kinds(
+            &state,
+            &headers,
+            &["host", "assist_config", "assist_cache", "assist_cache"],
+        )
+        .await;
+        assert_eq!(answer.status(), axum::http::StatusCode::OK);
+
+        // UwUSSH 0.2 reads the page with the protocol crate as it is pinned
+        // here — strictly, as 0.2 does — and gets the host and the end.
+        let old: uwussh_proto::PullResponse =
+            serde_json::from_slice(&pull_as(&state, &headers, 0, 0).await).unwrap();
+        assert_eq!(old.envelopes.len(), 1);
+        assert_eq!(old.envelopes[0].kind, uwussh_proto::EntityKind::Host);
+        assert_eq!(old.cursor.0, 4);
+        assert!(!old.has_more);
+
+        // Synced before the assistant's records came: a page that is empty
+        // and still moves the cursor to the end.
+        let caught_up: uwussh_proto::PullResponse =
+            serde_json::from_slice(&pull_as(&state, &headers, 1, 0).await).unwrap();
+        assert!(caught_up.envelopes.is_empty());
+        assert_eq!(caught_up.cursor.0, 4);
+
+        // A client that asks gets every one, under its own kind.
+        let new: crate::wire::PullResponse =
+            serde_json::from_slice(&pull_as(&state, &headers, 0, 1).await).unwrap();
+        let kinds: Vec<&str> = new.envelopes.iter().map(|env| env.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["host", "assist_config", "assist_cache", "assist_cache"]
+        );
+        assert_eq!(new.cursor.0, 4);
+    }
+
+    #[tokio::test]
+    async fn a_kind_that_is_no_name_is_refused_and_nothing_is_stored() {
+        let state = AppState::new(Db::open_in_memory().unwrap(), Config::default());
+        let (_, headers) = signed_in(&state);
+        let answer = push_kinds(&state, &headers, &["host", "Robert'); DROP TABLE"]).await;
+        assert!(answer.status().is_client_error(), "{}", answer.status());
+        let page: crate::wire::PullResponse =
+            serde_json::from_slice(&pull_as(&state, &headers, 0, 1).await).unwrap();
+        assert!(page.envelopes.is_empty());
+        assert_eq!(page.cursor.0, 0);
     }
 }
