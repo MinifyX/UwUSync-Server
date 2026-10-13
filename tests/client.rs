@@ -490,3 +490,486 @@ fn a_device_that_heard_the_wrong_words_gets_nothing() {
     assert_eq!(server.devices().unwrap().len(), 1);
     assert!(second.vault_header().unwrap().is_none());
 }
+
+// ── Teams ───────────────────────────────────────────────────────────────────
+//
+// The client's side of teams was written against a server it made up. These
+// run it against this one: its member key, its wraps, its rotation and its
+// mailbox, over HTTP, with nothing spoken by hand except where the point is
+// what the server says to a client that tries what its own store refuses.
+
+use uuid::Uuid;
+use uwussh_store::{KeymapDraft, SpaceHostDraft, Spaces, TeamRole};
+use uwussh_sync::team::TeamApi;
+use uwussh_sync::{MemberState, TeamPass, Teams};
+
+/// One device of one account, with its folder of spaces.
+struct Member {
+    folder: std::path::PathBuf,
+    spaces: Spaces,
+    server: Server,
+    account: Uuid,
+    /// The account key, on the device that made it.
+    kit: Option<AccountKey>,
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.folder);
+    }
+}
+
+fn spaces() -> (std::path::PathBuf, Spaces) {
+    let folder = std::env::temp_dir().join(format!("uwusync-teams-{}", Uuid::now_v7()));
+    let spaces = Spaces::open(&folder.join("uwussh.db")).unwrap();
+    (folder, spaces)
+}
+
+impl Member {
+    /// A new account on the server, as the app makes one.
+    fn new(running: &Running, device: &str) -> Self {
+        let (folder, spaces) = spaces();
+        spaces.main().create_vault_with(PASSWORD, KDF).unwrap();
+        let setup = setup_code(running);
+        let (server, paired) =
+            uwussh_sync::create_account(&spaces.main(), &setup, PASSWORD, device, protect).unwrap();
+        Self {
+            folder,
+            spaces,
+            server,
+            account: paired.account_id,
+            kit: paired.recovery,
+        }
+    }
+
+    /// Another device of the same account, enrolled with the master password.
+    fn second(&self, running: &Running, device: &str) -> Self {
+        let kit = self.kit.as_ref().expect("the first device's kit");
+        let header = self.spaces.main().vault_header().unwrap().unwrap();
+        let login_key = header.login_key(PASSWORD, Some(kit)).unwrap();
+        let enrolment = self.server.enrolment_token().unwrap();
+        let (seed, public_key) = device_key();
+        let joining = Server::connect(&running.url, None).unwrap();
+        let admitted = joining
+            .enrol(&EnrolDevice {
+                enrolment: enrolment.token,
+                auth_key: b64::encode(*login_key),
+                device: NewDevice {
+                    name: device.into(),
+                    public_key,
+                },
+            })
+            .unwrap();
+        let server = joining.as_device(admitted.account_id, admitted.device_id, &seed);
+        let downloaded = from_wire(&server.vault().unwrap()).unwrap();
+        let key = downloaded
+            .unlock_with(PASSWORD, Some(kit))
+            .unwrap()
+            .export_key();
+        let (folder, spaces) = spaces();
+        spaces.main().adopt_vault(&downloaded, key).unwrap();
+        Self {
+            folder,
+            spaces,
+            server,
+            account: self.account,
+            kit: None,
+        }
+    }
+
+    fn teams<R>(&self, f: impl FnOnce(&Teams<'_, Server>) -> R) -> R {
+        let main = self.spaces.main_id();
+        f(&Teams::new(&self.spaces, &main, &self.server))
+    }
+
+    /// What every sync of the server does: the account's own mailbox, then
+    /// its teams.
+    fn pass(&self) -> TeamPass {
+        let own = sync_once(&self.spaces.main(), &self.server).unwrap();
+        assert_eq!(own.apply.rejected, 0, "{own:?}");
+        self.teams(|teams| teams.pass()).unwrap()
+    }
+
+    fn fingerprint(&self) -> String {
+        self.pass().status.fingerprint.expect("a member key")
+    }
+
+    fn space(&self, team: Uuid) -> Option<uwussh_store::SpaceHandle> {
+        self.spaces.team_space(&self.spaces.main_id(), team)
+    }
+
+    fn add(
+        &self,
+        team: Uuid,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<Uuid, uwussh_store::StoreError> {
+        let mut draft = host(name, "192.0.2.10");
+        if let Some(password) = password {
+            draft.password = PasswordChange::Set {
+                value: SecretText::new(password),
+            };
+        }
+        self.spaces
+            .save_host(SpaceHostDraft {
+                draft,
+                space: Some(self.space(team).expect("the team's space").id),
+            })
+            .map(|saved| saved.host.id)
+    }
+
+    /// The names of the hosts the team has on this device.
+    fn hosts(&self, team: Uuid) -> Vec<String> {
+        self.space(team)
+            .map_or_else(Vec::new, |space| names(&space.store))
+    }
+
+    fn password(&self, team: Uuid, host: Uuid) -> Vec<u8> {
+        let space = self.space(team).expect("the team's space");
+        space
+            .store
+            .reveal_host_password(host)
+            .unwrap()
+            .as_slice()
+            .to_vec()
+    }
+}
+
+/// `owner` invites, `newcomer` joins and waits, and `owner` lets them in
+/// after comparing the fingerprint the newcomer's own device shows.
+fn admit(owner: &Member, team: Uuid, newcomer: &Member, role: TeamRole) {
+    let invite = owner.teams(|teams| teams.invite(team, role)).unwrap();
+    let joined = newcomer
+        .teams(|teams| teams.join(&invite.code.expect("a code, once"), "Somebody"))
+        .unwrap();
+    assert_eq!((joined.id, joined.state), (team, MemberState::Pending));
+
+    // Waiting: the team's name, and nothing of what is in it.
+    let waiting = newcomer.pass();
+    assert_eq!(waiting.status.teams[0].state, MemberState::Pending);
+    assert!(newcomer.space(team).is_none());
+    assert_eq!(
+        team_error(newcomer.server.pull(team, 0, 10)),
+        "membership-pending"
+    );
+
+    let seen = newcomer.fingerprint();
+    let listed = owner.teams(|teams| teams.members(team)).unwrap();
+    let theirs = listed
+        .iter()
+        .find(|member| member.account_id == newcomer.account)
+        .expect("the newcomer, listed");
+    assert_eq!(theirs.fingerprint, seen, "what both sides compare");
+    assert_eq!(
+        team_error(owner.teams(|teams| teams.confirm(team, newcomer.account, "0000-0000"))),
+        "identity-changed",
+        "and nothing is wrapped for a key nobody compared"
+    );
+    owner
+        .teams(|teams| teams.confirm(team, newcomer.account, &seen))
+        .unwrap();
+    let pass = newcomer.pass();
+    assert!(pass.spaces_changed);
+    assert_eq!(pass.status.teams[0].state, MemberState::Active);
+}
+
+fn team_error<T: std::fmt::Debug>(result: Result<T, uwussh_sync::TeamError>) -> String {
+    match result {
+        Err(error) => error.code().unwrap_or("none").to_string(),
+        Ok(value) => panic!("should have been refused: {value:?}"),
+    }
+}
+
+fn team_epoch(running: &Running, team: Uuid) -> (u64, bool) {
+    running
+        .state
+        .db
+        .lock()
+        .query_row(
+            "SELECT epoch, needs_rotation FROM teams WHERE id = ?1",
+            [team.to_string()],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn what_one_member_saves_in_a_team_the_other_reads_and_the_server_does_not() {
+    let running = start_with(Registration::Invite);
+    let (olive, ben) = (
+        Member::new(&running, "LVDesk1"),
+        Member::new(&running, "Bens"),
+    );
+
+    let status = olive.pass().status;
+    assert!(status.supported && status.enabled && status.may_create);
+    assert!(status.fingerprint.is_none() && status.teams.is_empty());
+
+    let made = olive.teams(|teams| teams.create("Ops", "Olive")).unwrap();
+    let team = made.id;
+    assert_eq!(
+        (made.role, made.state),
+        (TeamRole::Owner, MemberState::Active)
+    );
+    // Made with a key nobody opens, and given its real one at once.
+    assert_eq!(team_epoch(&running, team), (2, false));
+
+    admit(&olive, team, &ben, TeamRole::Editor);
+    let bastion = olive.add(team, "bastion", Some("hunter2")).unwrap();
+    assert!(olive.pass().records_changed);
+    assert!(ben.pass().records_changed);
+    assert_eq!(ben.hosts(team), ["bastion"]);
+    assert_eq!(ben.password(team, bastion), b"hunter2");
+
+    // And back: an editor writes.
+    ben.add(team, "db", None).unwrap();
+    ben.pass();
+    olive.pass();
+    assert_eq!(olive.hosts(team), ["bastion", "db"]);
+
+    // What the server holds of it reads as nothing.
+    let blobs: Vec<Vec<u8>> = {
+        let held = running.state.db.lock();
+        let mut rows = held.prepare("SELECT blob FROM team_records").unwrap();
+        let blobs = rows.query_map([], |row| row.get(0)).unwrap();
+        blobs.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert!(
+        blobs.len() >= 4,
+        "two hosts, a password, the confirmed keys"
+    );
+    for blob in &blobs {
+        let text = String::from_utf8_lossy(blob).to_string();
+        for secret in ["bastion", "192.0.2.10", "hunter2"] {
+            assert!(!text.contains(secret), "{secret} must not be readable");
+        }
+    }
+
+    // ── The accounts' own vaults go on as before ───────────────────────────
+    let mut own = host("nas", "192.0.2.9");
+    own.password = PasswordChange::Set {
+        value: SecretText::new("swordfish"),
+    };
+    let nas = olive.spaces.main().save_host(own).unwrap().id;
+    let keys = KeymapDraft {
+        bindings: [("terminal:clear".to_string(), Vec::new())].into(),
+        texts: Vec::new(),
+    };
+    olive.spaces.main().save_keymap("other", keys).unwrap();
+    olive.pass();
+
+    // Another device of the account gets its own vault with the keymap, and
+    // opens the team with the member key the server kept sealed for it.
+    let laptop = olive.second(&running, "LVLaptop");
+    let pass = laptop.pass();
+    assert_eq!(pass.status.fingerprint, olive.pass().status.fingerprint);
+    assert_eq!(names(&laptop.spaces.main()), ["nas"]);
+    assert_eq!(
+        laptop
+            .spaces
+            .main()
+            .reveal_host_password(nas)
+            .unwrap()
+            .as_slice(),
+        b"swordfish"
+    );
+    let keymap = laptop.spaces.main().keymap("other").unwrap();
+    assert!(keymap.bindings.contains_key("terminal:clear"));
+    assert_eq!(laptop.hosts(team), ["bastion", "db"]);
+    assert_eq!(laptop.password(team, bastion), b"hunter2");
+
+    // Nothing crossed over, in either direction, on either account.
+    ben.pass();
+    assert!(names(&ben.spaces.main()).is_empty());
+    assert!(ben
+        .spaces
+        .main()
+        .keymap("other")
+        .unwrap()
+        .bindings
+        .is_empty());
+    assert_eq!(names(&olive.spaces.main()), ["nas"]);
+    assert_eq!(olive.hosts(team), ["bastion", "db"]);
+    let (own_kinds, team_kinds): (i64, i64) = running
+        .state
+        .db
+        .lock()
+        .query_row(
+            "SELECT (SELECT count(*) FROM records WHERE id = ?1),
+                    (SELECT count(*) FROM team_records WHERE id = ?1)",
+            [uwussh_store::keymap_id("other").unwrap().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((own_kinds, team_kinds), (1, 0));
+}
+
+#[test]
+fn a_reader_reads_and_is_refused_a_write_by_the_store_and_by_the_server() {
+    let running = start_with(Registration::Invite);
+    let (olive, rita) = (
+        Member::new(&running, "LVDesk1"),
+        Member::new(&running, "Ritas"),
+    );
+    let team = olive
+        .teams(|teams| teams.create("Ops", "Olive"))
+        .unwrap()
+        .id;
+    admit(&olive, team, &rita, TeamRole::Reader);
+    olive.add(team, "bastion", None).unwrap();
+    olive.pass();
+    rita.pass();
+    assert_eq!(rita.hosts(team), ["bastion"]);
+
+    // The client does not try…
+    assert!(rita.space(team).unwrap().read_only);
+    assert!(rita.add(team, "mine", None).is_err());
+    let before = running
+        .state
+        .db
+        .lock()
+        .query_row("SELECT seq FROM teams", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    rita.pass();
+
+    // …and one that did is told no: here, a record of the team's own, sent
+    // back as it came.
+    let (epoch, _) = team_epoch(&running, team);
+    let page = rita.server.pull(team, 0, 10).unwrap();
+    assert_eq!((page.epoch, page.role), (epoch, TeamRole::Reader));
+    let mut edit = page.page.envelopes[0].clone();
+    edit.base_seq = edit.seq.unwrap_or(0);
+    assert_eq!(
+        team_error(rita.server.push(team, epoch, vec![edit.clone()])),
+        "forbidden"
+    );
+    let after = running
+        .state
+        .db
+        .lock()
+        .query_row("SELECT seq FROM teams", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(before, after);
+    // Nor does a reader invite, or confirm, or rotate.
+    assert_eq!(
+        team_error(rita.teams(|teams| teams.invite(team, TeamRole::Editor))),
+        "forbidden"
+    );
+
+    // Made an editor, the same device writes — and the owner's push under a
+    // key that is not the team's is the other refusal a client acts on.
+    olive
+        .teams(|teams| teams.set_role(team, rita.account, TeamRole::Editor))
+        .unwrap();
+    assert!(rita.pass().spaces_changed);
+    rita.add(team, "mine", None).unwrap();
+    rita.pass();
+    olive.pass();
+    assert_eq!(olive.hosts(team), ["bastion", "mine"]);
+    match olive.server.push(team, epoch - 1, vec![edit]) {
+        Err(uwussh_sync::TeamError::Refused {
+            code, epoch: now, ..
+        }) => {
+            assert_eq!((code.as_str(), now), ("stale-epoch", Some(epoch)));
+        }
+        other => panic!("an old epoch must be refused: {other:?}"),
+    }
+}
+
+#[test]
+fn a_removed_member_reads_nothing_more_and_who_stays_reads_everything() {
+    let running = start_with(Registration::Invite);
+    let (olive, ben, cleo) = (
+        Member::new(&running, "LVDesk1"),
+        Member::new(&running, "Bens"),
+        Member::new(&running, "Cleos"),
+    );
+    let team = olive
+        .teams(|teams| teams.create("Ops", "Olive"))
+        .unwrap()
+        .id;
+    admit(&olive, team, &ben, TeamRole::Editor);
+    admit(&olive, team, &cleo, TeamRole::Editor);
+    let bastion = olive.add(team, "bastion", Some("hunter2")).unwrap();
+    olive.add(team, "db", None).unwrap();
+    olive.pass();
+    ben.pass();
+    cleo.pass();
+    assert_eq!(ben.hosts(team), ["bastion", "db"]);
+    // Cleo has an edit nobody has seen when the key changes.
+    cleo.add(team, "cleo's", None).unwrap();
+    let old_key = cleo.space(team).unwrap().store.team_key().unwrap();
+    let (old_epoch, _) = team_epoch(&running, team);
+
+    // ── Out, and a new key in the same breath ──────────────────────────────
+    let known = olive
+        .teams(|teams| teams.remove(team, ben.account))
+        .unwrap();
+    assert_eq!(known.len(), 1, "the login Ben may still know: {known:?}");
+    assert_eq!((known[0].id, known[0].name.as_str()), (bastion, "bastion"));
+    assert_eq!(team_epoch(&running, team), (old_epoch + 1, false));
+    let kept: i64 = running
+        .state
+        .db
+        .lock()
+        .query_row(
+            "SELECT count(*) FROM team_records WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        kept >= 3,
+        "everything is there again, under the new key: {kept}"
+    );
+
+    // Ben: the server knows no such team for him, with the token he has and
+    // the key he kept, and his device lets go of it.
+    assert_eq!(team_error(ben.server.pull(team, 0, 10)), "not-found");
+    assert_eq!(team_error(ben.server.members(team)), "not-found");
+    assert!(ben.server.teams().unwrap().is_empty());
+    let pass = ben.pass();
+    assert!(pass.spaces_changed && pass.status.teams.is_empty());
+    assert!(ben.space(team).is_none());
+
+    // Written after the rotation.
+    let fresh = olive.add(team, "after", Some("tr0ub4dor")).unwrap();
+    olive.pass();
+
+    // Cleo follows: the new key, everything from before, what came after,
+    // and her own edit sealed again and sent.
+    cleo.pass();
+    let space = cleo.space(team).unwrap();
+    assert_eq!(
+        space.store.team_state().unwrap().unwrap().epoch,
+        old_epoch + 1
+    );
+    assert_ne!(*old_key, *space.store.team_key().unwrap());
+    assert_eq!(cleo.hosts(team), ["after", "bastion", "cleo's", "db"]);
+    assert_eq!(cleo.password(team, bastion), b"hunter2");
+    assert_eq!(cleo.password(team, fresh), b"tr0ub4dor");
+    olive.pass();
+    assert_eq!(olive.hosts(team), ["after", "bastion", "cleo's", "db"]);
+
+    // The accounts' own vaults never noticed.
+    for member in [&olive, &ben, &cleo] {
+        member
+            .spaces
+            .main()
+            .save_host(host("own", "192.0.2.20"))
+            .unwrap();
+        member.pass();
+        assert_eq!(names(&member.spaces.main()), ["own"]);
+    }
+    let own: i64 = running
+        .state
+        .db
+        .lock()
+        .query_row(
+            "SELECT count(DISTINCT account_id) FROM records",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(own, 3);
+}
