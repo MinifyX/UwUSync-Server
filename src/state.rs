@@ -8,6 +8,7 @@ use crate::Config;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -21,6 +22,27 @@ pub struct AppState {
     pub limits: RateLimiter,
     pub events: Events,
     pub pairings: Pairings,
+    pub clock: Clock,
+}
+
+/// What time it is, for whatever runs out: a team invite, so far. The
+/// system's clock, plus however far a test has moved it on — which is how a
+/// test lets a week pass without waiting for it.
+#[derive(Clone, Default)]
+pub struct Clock {
+    ahead_ms: Arc<AtomicU64>,
+}
+
+impl Clock {
+    /// Milliseconds since the Unix epoch.
+    pub fn now_ms(&self) -> u64 {
+        crate::now_ms().saturating_add(self.ahead_ms.load(Ordering::Relaxed))
+    }
+
+    /// Let time pass. Nothing outside tests calls this.
+    pub fn advance(&self, ms: u64) {
+        self.ahead_ms.fetch_add(ms, Ordering::Relaxed);
+    }
 }
 
 impl AppState {
@@ -33,18 +55,32 @@ impl AppState {
             limits: RateLimiter::default(),
             events: Events::default(),
             pairings: Pairings::default(),
+            clock: Clock::default(),
         }
     }
 }
 
-/// "There is something new from sequence N", per account.
+/// What a listening device is told: where to look, and nothing of what is
+/// there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum News {
+    /// The account's own vault has records up to this sequence number.
+    Records(u64),
+    /// Something about this team changed — its records, its key, who is in
+    /// it, its name — or the account's place in it did, which includes being
+    /// taken out and the team being deleted.
+    Team(Uuid),
+}
+
+/// "There is something new from sequence N", per account — or "look at this
+/// team again".
 ///
-/// Only the number travels — a device that hears it pulls, and the pull is the
-/// same one it would have made anyway. Nothing about a record is ever pushed
-/// out, so this stays a hint rather than a second way in.
+/// Only the number, or the team's id, travels — a device that hears it pulls,
+/// and the pull is the same one it would have made anyway. Nothing about a
+/// record is ever pushed out, so this stays a hint rather than a second way in.
 #[derive(Clone, Default)]
 pub struct Events {
-    channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<u64>>>>,
+    channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<News>>>>,
     /// Open event streams per device.
     streams: Arc<Mutex<HashMap<Uuid, usize>>>,
 }
@@ -72,7 +108,7 @@ impl Drop for StreamGuard {
 }
 
 impl Events {
-    pub fn subscribe(&self, account: Uuid) -> broadcast::Receiver<u64> {
+    pub fn subscribe(&self, account: Uuid) -> broadcast::Receiver<News> {
         self.channels
             .lock()
             .entry(account)
@@ -82,6 +118,19 @@ impl Events {
 
     /// Tell whoever is listening. Nobody listening is the normal case.
     pub fn announce(&self, account: Uuid, seq: u64) {
+        self.tell(account, News::Records(seq));
+    }
+
+    /// Tell every one of these accounts to look at a team again. Who they are
+    /// is the caller's to know: the members, and whoever just stopped being
+    /// one.
+    pub fn announce_team(&self, accounts: &[Uuid], team: Uuid) {
+        for account in accounts {
+            self.tell(*account, News::Team(team));
+        }
+    }
+
+    fn tell(&self, account: Uuid, news: News) {
         let mut channels = self.channels.lock();
         // A channel nobody listens to any more is dropped instead of kept for
         // an account that may never come back.
@@ -90,7 +139,7 @@ impl Events {
                 channels.remove(&account);
                 return;
             }
-            let _ = sender.send(seq);
+            let _ = sender.send(news);
         }
     }
 
@@ -260,7 +309,11 @@ mod tests {
         assert_eq!(events.listeners(account), 1);
 
         events.announce(account, 7);
-        assert_eq!(listener.recv().await.unwrap(), 7);
+        assert_eq!(listener.recv().await.unwrap(), News::Records(7));
+
+        let team = Uuid::now_v7();
+        events.announce_team(&[Uuid::now_v7(), account], team);
+        assert_eq!(listener.recv().await.unwrap(), News::Team(team));
 
         // Another account hears nothing.
         events.announce(Uuid::now_v7(), 9);

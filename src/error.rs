@@ -45,12 +45,91 @@ pub enum ApiError {
     /// checked — answered the way axum's own extractor answers it.
     #[error("{0}")]
     Body(#[from] JsonRejection),
+    /// Something a team does not allow. See [`TeamError`].
+    #[error("{0}")]
+    Team(#[from] TeamError),
+}
+
+/// What a team refuses, each with a name of its own: a client decides by the
+/// name what to do next — ask again with the epoch it was told, pull first,
+/// show the person that they are still waiting to be let in.
+///
+/// A team somebody is no member of is not in here. That is `not-found`,
+/// whether there is such a team or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TeamError {
+    #[error("teams are switched off on this server")]
+    Disabled,
+    #[error("this server lets nobody create a team")]
+    CreationClosed,
+    #[error("your role in this team does not allow that")]
+    Forbidden,
+    #[error("your membership has not been confirmed yet")]
+    Pending,
+    #[error("that code is not valid, or not any more")]
+    InvalidInvite,
+    #[error("this account is in as many teams as this server allows")]
+    TeamLimit,
+    #[error("this team has as many members as this server allows")]
+    TeamFull,
+    #[error("this team has as many open invites as it may; revoke one first")]
+    TooManyInvites,
+    #[error("this account has no team identity yet")]
+    NoIdentity,
+    #[error("this account has a team identity already")]
+    IdentityExists,
+    #[error("the member's team identity is not the one that was named")]
+    IdentityChanged,
+    #[error("this account is in the team already")]
+    AlreadyMember,
+    #[error("a team keeps at least one owner")]
+    LastOwner,
+    #[error("the keys do not name exactly the active members")]
+    MembersMismatch,
+    #[error("there are records newer than the cursor that was named")]
+    StaleCursor,
+    #[error("that member is not waiting to be confirmed")]
+    NotPending,
+    #[error("that member has not been confirmed yet")]
+    NotActive,
+    /// With the epoch the team is at, so the client need not ask.
+    #[error("the team is at epoch {current}")]
+    StaleEpoch { current: u64 },
+}
+
+impl TeamError {
+    fn code(&self) -> (StatusCode, &'static str) {
+        use StatusCode as S;
+        match self {
+            Self::Disabled => (S::FORBIDDEN, "teams-disabled"),
+            Self::CreationClosed => (S::FORBIDDEN, "team-creation-closed"),
+            Self::Forbidden => (S::FORBIDDEN, "forbidden"),
+            Self::Pending => (S::FORBIDDEN, "membership-pending"),
+            Self::InvalidInvite => (S::FORBIDDEN, "invalid-invite"),
+            Self::TeamLimit => (S::FORBIDDEN, "team-limit"),
+            Self::TeamFull => (S::FORBIDDEN, "team-full"),
+            Self::TooManyInvites => (S::FORBIDDEN, "too-many-invites"),
+            Self::NoIdentity => (S::CONFLICT, "no-identity"),
+            Self::IdentityExists => (S::CONFLICT, "identity-exists"),
+            Self::IdentityChanged => (S::CONFLICT, "identity-changed"),
+            Self::AlreadyMember => (S::CONFLICT, "already-member"),
+            Self::LastOwner => (S::CONFLICT, "last-owner"),
+            Self::MembersMismatch => (S::CONFLICT, "members-mismatch"),
+            Self::StaleCursor => (S::CONFLICT, "stale-cursor"),
+            Self::NotPending => (S::CONFLICT, "not-pending"),
+            Self::NotActive => (S::CONFLICT, "not-active"),
+            Self::StaleEpoch { .. } => (S::CONFLICT, "stale-epoch"),
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct Body {
     error: &'static str,
     message: String,
+    /// Only with `stale-epoch`: the epoch the team is at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<u64>,
 }
 
 impl ApiError {
@@ -69,6 +148,7 @@ impl ApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
             Self::Body(rejection) => (rejection.status(), "invalid"),
+            Self::Team(refusal) => refusal.code(),
         }
     }
 }
@@ -92,7 +172,16 @@ impl IntoResponse for ApiError {
             }
             other => other.to_string(),
         };
-        (status, Json(Body { error, message })).into_response()
+        let epoch = match &self {
+            Self::Team(TeamError::StaleEpoch { current }) => Some(*current),
+            _ => None,
+        };
+        let body = Body {
+            error,
+            message,
+            epoch,
+        };
+        (status, Json(body)).into_response()
     }
 }
 

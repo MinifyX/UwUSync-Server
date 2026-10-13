@@ -50,6 +50,55 @@ impl Registration {
     }
 }
 
+/// Who may start a team on this server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamCreation {
+    /// Every account. The default.
+    All,
+    /// Nobody: the teams there are stay, and no new one comes.
+    None,
+}
+
+impl TeamCreation {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            "none" => Self::None,
+            _ => return None,
+        })
+    }
+}
+
+/// The most members any setting lets a team have. A rotation names every one
+/// of them in one request.
+pub const TEAM_MEMBERS_CEILING: u64 = 1000;
+
+/// What the operator decides about teams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Teams {
+    /// Off: every team endpoint but the one that says so refuses. What teams
+    /// hold stays in the database, untouched, until they are switched on
+    /// again or deleted from the command line.
+    pub enabled: bool,
+    pub creation: TeamCreation,
+    /// Teams one account may be in, counting those it only waits to be let
+    /// into.
+    pub max_per_account: u64,
+    /// Members one team may have, counting those who wait.
+    pub max_members: u64,
+}
+
+impl Default for Teams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            creation: TeamCreation::All,
+            max_per_account: 10,
+            max_members: 50,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Where the database and, later, the certificate live. One volume.
@@ -75,8 +124,10 @@ pub struct Config {
     pub channel: Option<String>,
     /// How many accounts this server takes, whoever asks.
     pub max_accounts: u64,
-    /// What one account may hold, and what all of them together may.
+    /// What one account may hold — and one team, which gets the same — and
+    /// what all of them together may.
     pub quota: crate::db::records::Quota,
+    pub teams: Teams,
     /// Connections open at once, from everybody.
     pub max_connections: usize,
     /// Connections open at once from one address (an IPv6 /64 counts as one).
@@ -103,6 +154,7 @@ impl Default for Config {
             channel: None,
             max_accounts: 100,
             quota: crate::db::records::Quota::default(),
+            teams: Teams::default(),
             max_connections: 512,
             max_connections_per_address: 32,
             kdf_floor: crate::db::accounts::KdfFloor::default(),
@@ -164,6 +216,25 @@ impl Config {
             config.quota.server_bytes = number("UWUSYNC_SERVER_MAX_MB", &megabytes)?
                 .checked_mul(1024 * 1024)
                 .ok_or("UWUSYNC_SERVER_MAX_MB is more than any disk")?;
+        }
+        if let Some(teams) = var("UWUSYNC_TEAMS") {
+            config.teams.enabled = switch(&teams)
+                .ok_or_else(|| format!("UWUSYNC_TEAMS must be on or off: {teams}"))?;
+        }
+        if let Some(creation) = var("UWUSYNC_TEAM_CREATION") {
+            config.teams.creation = TeamCreation::parse(&creation)
+                .ok_or_else(|| format!("UWUSYNC_TEAM_CREATION must be all or none: {creation}"))?;
+        }
+        if let Some(max) = var("UWUSYNC_MAX_TEAMS_PER_ACCOUNT") {
+            config.teams.max_per_account = number("UWUSYNC_MAX_TEAMS_PER_ACCOUNT", &max)?;
+        }
+        if let Some(max) = var("UWUSYNC_MAX_TEAM_MEMBERS") {
+            config.teams.max_members = number("UWUSYNC_MAX_TEAM_MEMBERS", &max)?;
+            if config.teams.max_members == 0 || config.teams.max_members > TEAM_MEMBERS_CEILING {
+                return Err(format!(
+                    "UWUSYNC_MAX_TEAM_MEMBERS must be between 1 and {TEAM_MEMBERS_CEILING}: {max}"
+                ));
+            }
         }
         if let Some(max) = var("UWUSYNC_MAX_CONNECTIONS") {
             config.max_connections = number("UWUSYNC_MAX_CONNECTIONS", &max)? as usize;
@@ -273,6 +344,10 @@ mod tests {
         assert_eq!(config.max_connections_per_address, 32);
         assert_eq!(config.kdf_floor.memory_kib, 19456);
         assert_eq!(config.kdf_floor.time_cost, 2);
+        assert!(config.teams.enabled);
+        assert_eq!(config.teams.creation, TeamCreation::All);
+        assert_eq!(config.teams.max_per_account, 10);
+        assert_eq!(config.teams.max_members, 50);
     }
 
     #[test]

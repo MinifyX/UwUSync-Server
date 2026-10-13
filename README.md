@@ -139,7 +139,11 @@ be told its password was wrong, and would go looking in the wrong place.
 | `UWUSYNC_MAX_ACCOUNTS`    | `100`              | How many accounts the server takes, whoever asks                  |
 | `UWUSYNC_ACCOUNT_MAX_RECORDS` | `100000`       | What one account may hold, in records…                            |
 | `UWUSYNC_ACCOUNT_MAX_MB`  | `256`              | …and in megabytes                                                 |
-| `UWUSYNC_SERVER_MAX_MB`   | `2048`             | What all accounts together may hold, in megabytes                 |
+| `UWUSYNC_SERVER_MAX_MB`   | `2048`             | What all accounts and teams together may hold, in megabytes       |
+| `UWUSYNC_TEAMS`           | `on`               | Teams: vaults several accounts share. `off` for none              |
+| `UWUSYNC_TEAM_CREATION`   | `all`              | Who may create a team: `all` accounts or `none`                   |
+| `UWUSYNC_MAX_TEAMS_PER_ACCOUNT` | `10`         | How many teams one account may be in                              |
+| `UWUSYNC_MAX_TEAM_MEMBERS` | `50`              | Members of one team; a team may hold what one account may         |
 | `UWUSYNC_MAX_CONNECTIONS` | `512`              | Connections open at once, from everybody                          |
 | `UWUSYNC_MAX_CONNECTIONS_PER_IP` | `32`       | …and from one address (an IPv6 /64); `0` for no limit. Not applied behind a proxy |
 
@@ -156,6 +160,9 @@ uwusync-server fingerprint      what a device pins, to compare by eye
 uwusync-server accounts         what is on this server, and how many devices each has
 uwusync-server devices <id>     the devices of an account
 uwusync-server revoke <id>      shut a device out
+uwusync-server teams            the teams on this server: members, records, since when
+uwusync-server team-delete <id> delete a team with everything in it
+uwusync-server team-owner <team> <account>   make a member an owner, for a team without one
 uwusync-server backup           a consistent copy, right now
 uwusync-server restore [name]   list the backups, or put one back (server stopped)
 uwusync-server health           the container's health check
@@ -193,7 +200,8 @@ the same crate the client uses, so a schema change is one edit in one place.
 | `GET /v1/vault`, `POST /v1/vault/params`     | The vault header; the parameters a joining device needs |
 | `PUT /v1/vault/key`                          | A new master password: rewrap, no record touched      |
 | `GET /v1/records`, `POST /v1/records`        | Pull from a cursor, push with a version               |
-| `GET /v1/events`                             | "There is something new from N" (server-sent events)  |
+| `GET /v1/events`                             | "There is something new from N", or in a team (server-sent events) |
+| `/v1/teams/…`                                | Teams: shared vaults, their members, invites, keys and records — [docs/teams.md](docs/teams.md) |
 | `GET /v1/devices`, `POST /v1/devices/invite`, `POST /v1/devices/enrol`, `POST /v1/devices/{id}/revoke` | Devices: list, let one in, shut one out — another one only with the master password |
 | `POST /v1/pair`, `GET`/`POST`/`DELETE /v1/pair/{id}` | The post box two devices pair through           |
 | `GET /healthz`                               | Alive, and what schema it speaks                      |

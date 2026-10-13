@@ -4,7 +4,7 @@ use crate::auth::Authenticated;
 use crate::connections::Holding;
 use crate::db::{devices, records};
 use crate::limits;
-use crate::state::AppState;
+use crate::state::{AppState, News};
 use crate::wire::{PushRequest, PushResponse, Reader};
 use crate::{ApiError, Result};
 use axum::body::Body;
@@ -113,8 +113,9 @@ pub async fn push(
 /// How often an open event stream asks whether its token is still good.
 const RECHECK: Duration = Duration::from_secs(30);
 
-/// "There is something new from sequence N." Nothing else is ever pushed out:
-/// the device pulls, the same way it would have anyway. The event names no
+/// "There is something new from sequence N" — or, as an event named `team`
+/// with the team's id, "look at this team again". Nothing else is ever pushed
+/// out: the device pulls, the same way it would have anyway. The event names no
 /// kind, so it needs no filtering: a device woken for records it does not
 /// read pulls a page without them, and the cursor still moves past them.
 ///
@@ -143,8 +144,15 @@ pub async fn events(
         loop {
             tokio::select! {
                 news = receiver.recv() => match news {
-                    Ok(seq) => {
-                        let event = Event::default().event("records").data(seq.to_string());
+                    Ok(news) => {
+                        let event = match news {
+                            News::Records(seq) => {
+                                Event::default().event("records").data(seq.to_string())
+                            }
+                            News::Team(team) => {
+                                Event::default().event("team").data(team.to_string())
+                            }
+                        };
                         if sender.send(Ok(event)).await.is_err() {
                             return;
                         }

@@ -118,6 +118,25 @@ pub const JOINS: Bucket = Bucket {
     when_full: WhenFull::Admit,
 };
 
+/// Everything about a team but its records: who is in it, its invites, its
+/// keys. A person does these by hand; a client lists its teams on every pass.
+pub const TEAMS: Bucket = Bucket {
+    name: "teams",
+    max: 300,
+    window: Duration::from_secs(60),
+    when_full: WhenFull::Admit,
+};
+
+/// Redeeming a team invite. A code is 73 bits, so this is not what keeps it
+/// from being guessed — it is what keeps an account from trying. One that
+/// worked does not count.
+pub const TEAM_JOIN: Bucket = Bucket {
+    name: "team-join",
+    max: 10,
+    window: Duration::from_secs(10 * 60),
+    when_full: WhenFull::Admit,
+};
+
 /// Proving the master password with a device token — a password change, or
 /// revoking another device. Counted **per device**: many wrong proofs are
 /// somebody with a stolen device guessing, and counting them for the whole
@@ -391,6 +410,14 @@ impl RateLimiter {
         if let Some(table) = self.inner.lock().addresses.get_mut(bucket.name) {
             Self::take_back(table, who, bucket);
         }
+    }
+
+    pub fn forgive_account(&self, account: Uuid, bucket: &Bucket) {
+        Self::take_back(
+            &mut self.inner.lock().members,
+            &format!("account:{account}"),
+            bucket,
+        );
     }
 
     pub fn forgive_device(&self, device: Uuid, bucket: &Bucket) {

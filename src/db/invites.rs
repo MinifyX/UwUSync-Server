@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 /// Fifteen characters from thirty, in three groups: about 73 bits, which no
 /// rate-limited guesser will ever walk through.
-fn code() -> String {
+pub(crate) fn code() -> String {
     let bytes = random_bytes::<15>();
     let mut code = String::with_capacity(17);
     for (index, byte) in bytes.iter().enumerate() {
@@ -35,7 +35,7 @@ fn normalise(code: &str) -> String {
         .collect()
 }
 
-fn hash(code: &str) -> Vec<u8> {
+pub(crate) fn hash(code: &str) -> Vec<u8> {
     sha256(normalise(code).as_bytes()).to_vec()
 }
 
