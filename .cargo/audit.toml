@@ -1,0 +1,8 @@
+# `cargo audit` reads this.
+[advisories]
+ignore = [
+    # rsa (Marvin attack, no fixed release). Only in the dependency tree of the tests: the UwUSSH
+    # client crates that tests/client.rs runs against this server bring UwULock's client along.
+    # Nothing of it is in the server binary. `cargo tree -i rsa -e normal` stays empty.
+    "RUSTSEC-2023-0071",
+]
