@@ -434,6 +434,15 @@ CREATE TABLE team_records (
 );
 
 CREATE INDEX team_records_by_seq ON team_records (team_id, seq);
+
+-- How far each device has read each team: what says when a deleted record's
+-- marker has been seen by every device that could bring the record back.
+CREATE TABLE team_cursors (
+    team_id         TEXT    NOT NULL REFERENCES teams (id),
+    device_id       TEXT    NOT NULL REFERENCES devices (id),
+    cursor          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (team_id, device_id)
+);
 "#;
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -517,7 +526,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 10);
+        assert_eq!(tables, 11);
     }
 
     /// A database as 0.2 left it — schema 3, with an account and a record —

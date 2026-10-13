@@ -30,7 +30,13 @@ sets in [docs/deployment.md](docs/deployment.md#teams).
   it in which role. The database is upgraded in place at the first start; a backup from 0.2 can
   be restored into 0.3, not the other way round.
 - `GET /v1/events` has a second event beside `records`: `team`, with a team's id, when one of the
-  account's teams changed.
+  account's teams changed — or with `*` when the stream fell behind and the client should look at
+  all of them.
+- A device replaces its account's member key only with the master password, as it changes the
+  password or revokes a device only with it. An invite stops working when the member who made it
+  is removed or may no longer invite. The nightly cleanup forgets the markers of deleted team
+  records as it does an account's: after 90 days, once every device that reads the team has seen
+  them.
 
 ## 0.2.2
 

@@ -2525,11 +2525,48 @@ mod teams {
         assert_eq!(confirm(&server, &owner, team, &other, 2, 1).await.0, 204);
         assert_eq!(pull(&server, &other, team, 0).await.0, 200);
 
+        // Sealing the same key anew is the device's to do with its token.
+        let resealed = put(
+            "other",
+            json!({ "public_key": key(2), "sealed_private": wrapped("resealed"), "replace": true }),
+        )
+        .await;
+        assert_eq!(resealed.0, 200, "{resealed:?}");
+        assert_eq!(mine(&server, &other).await[0]["state"], "active");
+
+        // Another key is the account holder's to put there, not a device's:
+        // not without the master password, and not with a wrong one.
+        for proof in [None, Some("a guess")] {
+            let mut body = json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true });
+            if let Some(password) = proof {
+                body["current_auth_key"] = json!(login_key(password));
+            }
+            assert_eq!(
+                refused(&put("other", body).await),
+                (403, "wrong-password"),
+                "{proof:?}"
+            );
+        }
+        let malformed = put(
+            "other",
+            json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true,
+                    "current_auth_key": "short" }),
+        )
+        .await;
+        assert_eq!(refused(&malformed), (400, "invalid"));
+        assert_eq!(
+            get(&server, &other, "/v1/teams/identity").await.1["public_key"],
+            key(2)
+        );
+        assert_eq!(mine(&server, &other).await[0]["state"], "active");
+        assert_eq!(pull(&server, &other, team, 0).await.0, 200);
+
         // Replaced: what was wrapped to the old key is dropped, and the
         // member waits until somebody has checked the new one.
         let replaced = put(
             "other",
-            json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true }),
+            json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true,
+                    "current_auth_key": login_key("master") }),
         )
         .await;
         assert_eq!(replaced.0, 200, "{replaced:?}");
@@ -2703,6 +2740,153 @@ mod teams {
         assert_eq!(mine(&server, &owner).await.len(), 2);
     }
 
+    #[tokio::test]
+    async fn an_invite_lasts_as_long_as_its_maker_may_invite() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let admin = member(&server, 2).await;
+        let newcomer = member(&server, 3).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &admin, 2, "admin").await;
+        let at = format!("/v1/teams/{team}/members/{}", admin.account);
+        let invites = format!("/v1/teams/{team}/invites");
+        let kept = invite(&server, &owner, team, "reader").await;
+
+        // Made by an admin who is then an editor: it lets nobody in.
+        let made = invite(&server, &admin, team, "admin").await;
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            patch(&server, &owner, &at, json!({ "role": "editor" }))
+                .await
+                .0,
+            204
+        );
+        assert_eq!(
+            refused(&join(&server, &newcomer, &made).await),
+            (403, "invalid-invite")
+        );
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Made by an admin who is then taken out: the same.
+        assert_eq!(
+            patch(&server, &owner, &at, json!({ "role": "admin" }))
+                .await
+                .0,
+            204
+        );
+        let made = invite(&server, &admin, team, "admin").await;
+        assert_eq!(delete(&server, &owner, &at).await.0, 204);
+        assert_eq!(
+            refused(&join(&server, &newcomer, &made).await),
+            (403, "invalid-invite")
+        );
+
+        // Anybody else's are as good as they were.
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(join(&server, &newcomer, &kept).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_record_is_forgotten_once_every_reading_device_has_seen_it() {
+        use uwusync_server::db::teams as stored;
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let reader = member(&server, 2).await;
+        let never = member(&server, 3).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &reader, 2, "reader").await;
+        // A member whose device never reads the team holds nothing back.
+        admit(&server, &owner, team, &never, 3, "reader").await;
+
+        let id = Uuid::now_v7();
+        assert_eq!(
+            push(&server, &owner, team, 1, &[record(team, id, 0, b"sealed")])
+                .await
+                .0,
+            200
+        );
+        assert_eq!(pull(&server, &reader, team, 0).await.1["cursor"], 1);
+        let mut gone = record(team, id, 1, b"gone");
+        gone.deleted = true;
+        let pushed = push(&server, &owner, team, 1, &[gone]).await;
+        assert_eq!(pushed.1["accepted"][0]["seq"], 2, "{pushed:?}");
+        assert_eq!(pull(&server, &owner, team, 0).await.1["cursor"], 2);
+
+        let later = server.state.clock.now_ms() + WEEK_MS;
+        let purge =
+            |before: u64| stored::purge_tombstones(&server.state.db.lock(), team, before).unwrap();
+        // The reader's device has the record and not yet the marker.
+        assert_eq!(
+            stored::lowest_cursor(&server.state.db.lock(), team).unwrap(),
+            1
+        );
+        assert_eq!(purge(later), 0);
+        assert_eq!(
+            pull(&server, &reader, team, 1).await.1["envelopes"][0]["deleted"],
+            true
+        );
+        // Seen by all, but not old yet.
+        assert_eq!(purge(0), 0);
+        assert_eq!(purge(later), 1);
+        assert!(pull(&server, &never, team, 0).await.1["envelopes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let held: (i64, i64) = server
+            .state
+            .db
+            .lock()
+            .query_row("SELECT record_count, record_bytes FROM teams", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(held, (0, 0));
+
+        // The operator's delete takes the whole team or nothing.
+        assert!(stored::delete_any(&server.state.db.lock(), team).unwrap());
+        assert!(!stored::delete_any(&server.state.db.lock(), team).unwrap());
+        let left: i64 = server
+            .state
+            .db
+            .lock()
+            .query_row(
+                "SELECT (SELECT count(*) FROM team_cursors) + (SELECT count(*) FROM team_members)
+                      + (SELECT count(*) FROM team_invites) + (SELECT count(*) FROM teams)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(
+            refused(&pull(&server, &owner, team, 0).await),
+            (404, "not-found")
+        );
+    }
+
     /// Read the stream until `wanted` has come by.
     async fn hears(stream: &mut reqwest::Response, wanted: &str) {
         let mut heard = String::new();
@@ -2768,5 +2952,29 @@ mod teams {
         let out = format!("/v1/teams/{team}/members/{}", reader.account);
         assert_eq!(delete(&server, &owner, &out).await.0, 204);
         hears(&mut stream, &event).await;
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_missed_events_is_told_to_look_at_every_team() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let team = team(&server, &owner).await;
+        let mut stream = server
+            .client
+            .get(server.url("/v1/events"))
+            .bearer_auth(&owner.token)
+            .send()
+            .await
+            .unwrap();
+        while server.state.events.listeners(owner.account) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // More at once than a stream holds, with no chance to read between.
+        for _ in 0..40 {
+            server.state.events.announce_team(&[owner.account], team);
+        }
+        hears(&mut stream, "event: team\ndata: *\n").await;
+        // And what it still held follows.
+        hears(&mut stream, &format!("event: team\ndata: {team}")).await;
     }
 }

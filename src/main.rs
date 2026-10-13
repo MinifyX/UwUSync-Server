@@ -481,6 +481,22 @@ fn purge(db: &Db) {
             Err(error) => tracing::warn!(%error, "could not purge tombstones"),
         }
     }
+    // Teams the same way, one at a time.
+    let teams = match teams::all(&db.lock()) {
+        Ok(teams) => teams,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the teams");
+            return;
+        }
+    };
+    for team in teams {
+        let before = now_ms().saturating_sub(NINETY_DAYS_MS);
+        match teams::purge_tombstones(&db.lock(), team.id, before) {
+            Ok(0) => {}
+            Ok(gone) => tracing::info!(team = %team.id, gone, "tombstones forgotten"),
+            Err(error) => tracing::warn!(%error, "could not purge a team's tombstones"),
+        }
+    }
 }
 
 /// Whether a backup to `path` leaves the disk with room to spare. A backup

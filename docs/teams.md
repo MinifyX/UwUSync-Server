@@ -107,18 +107,24 @@ hands out another account's sealed key.
 ### `PUT /v1/teams/identity`
 
 ```json
-{ "public_key": "<base64url, 32 bytes>", "sealed_private": "<base64url>", "replace": false }
+{
+  "public_key": "<base64url, 32 bytes>",
+  "sealed_private": "<base64url>",
+  "replace": false,
+  "current_auth_key": "<base64url, 32 bytes>"
+}
 ```
 
-`replace` may be left out and is then `false`. Answers `200` with the stored identity, in the
-shape of the `GET`.
+`replace` may be left out and is then `false`. `current_auth_key` is left out too, except in the
+one case below that asks for it. Answers `200` with the stored identity, in the shape of the
+`GET`.
 
 | The account has…                     | `replace: false`                 | `replace: true`                          |
 | ------------------------------------ | -------------------------------- | ---------------------------------------- |
 | no identity                          | stored                           | stored                                   |
 | exactly this pair                    | `200`, nothing changes           | `200`, nothing changes                   |
 | this `public_key`, another `sealed_private` | `409` `identity-exists`   | `sealed_private` is replaced; nothing else changes |
-| another `public_key`                 | `409` `identity-exists`          | replaced — **see below**                 |
+| another `public_key`                 | `409` `identity-exists`          | replaced, with `current_auth_key` — **see below** |
 
 The first write wins, so two devices of one account that both make a pair end with one: the
 loser gets `identity-exists`, reads the identity with `GET` and uses that.
@@ -133,6 +139,19 @@ writes nothing in those teams until an owner or admin who has checked the new ke
 again (`confirm`, below). The members of those teams get a `team` event. A sole owner who does
 this, in a team without an admin, can let nobody in again — itself included; what is left to
 them is to delete the team.
+
+Because of that, a device's token is not enough for it. A request with `replace: true` and a
+`public_key` other than the stored one must prove the master password in `current_auth_key`: the
+account's current login key, the same value and encoding (URL-safe base64 without padding, 32
+bytes) that a device revocation sends as `currentAuthKey` — here in snake case, like every field
+of this API. The field is ignored in every other case of the table (first write, the same pair,
+the same `public_key` sealed anew), so a client need not send it there.
+
+| Status | `error`          | When                                                                 |
+| ------ | ---------------- | -------------------------------------------------------------------- |
+| 403    | `wrong-password` | `current_auth_key` is missing, or is not the account's login key. Nothing changed. |
+| 400    | `invalid`        | `current_auth_key` is not base64url of 32 bytes.                     |
+| 429    | `rate-limited`   | Too many wrong proofs from this device (10 an hour, shared with password change and device revocation; a right one clears the count). |
 
 ## Teams
 
@@ -213,6 +232,11 @@ made from a member, with `PATCH …/members/{account_id}`). `200`:
 ```
 
 `403` `too-many-invites` when the team has 20 open ones; revoke one, or wait for one to run out.
+
+An invite lasts only as long as the member who made it may invite: when that member is removed,
+leaves, or is made an editor or reader, the open invites they made are deleted in the same step
+and their codes answer `invalid-invite`. A member who waits again after replacing their key
+keeps theirs.
 
 ### `GET /v1/teams/{id}/invites`
 
@@ -407,7 +431,12 @@ new one); otherwise the server's version comes back in `conflicts`.
 | 400    | `invalid`     | An envelope `/v1/records` would refuse too — and one whose `vault_id` is not this team's id. |
 | 413    | `too-large`   | The team is full (see [Limits](#limits)), or the server is.              |
 
-A record marked `deleted` stays as a marker until the next rotation, which deletes everything.
+A record marked `deleted` stays as a marker so that every device learns of the deletion. The
+server remembers, per device, the cursor of its last pull of the team, and once a night forgets
+the markers that are older than 90 days and that every device which ever pulled the team has
+pulled past — the devices of current members, not revoked ones. A device that never pulled the
+team holds no copy and keeps no marker alive; a device that is away keeps them all until it
+returns or is revoked. A rotation deletes the markers with everything else.
 
 ## Events
 
@@ -432,9 +461,21 @@ key, a removal (also to the removed account) and the deletion of the team (to th
 it). The event does not say which; on one, a client fetches `GET /v1/teams` and, for a team it is
 active in, pulls. A team that is not in the list any more is gone for this account.
 
-A stream that falls behind drops events, as it does for `records`: sync on connecting, and treat
-the stream as a hint. A team deleted from the operator's command line sends no event; members
-notice at their next request (`404`).
+A stream holds 16 undelivered events. One that falls further behind loses the oldest of them,
+and is told so:
+
+```
+event: team
+data: *
+```
+
+`data` is the single character `*` in place of a team id. It means: events were missed, and
+which is unknown — fetch `GET /v1/teams`, pull every team the account is active in, and pull the
+account's own vault too (a `records` event may be among the lost). Events still held follow it as
+usual. A client must check for `*` before reading `data` as an id.
+
+Beyond that, treat the stream as a hint and sync on connecting. A team deleted from the
+operator's command line sends no event; members notice at their next request (`404`).
 
 ## Limits
 
@@ -464,6 +505,7 @@ notice at their next request (`404`).
 | `no-identity`          | 409    | The account has no member key yet: `PUT /v1/teams/identity`.   |
 | `identity-exists`      | 409    | The account has a member key, and `replace` was not set.       |
 | `identity-changed`     | 409    | The member's public key is not the one the key was wrapped to. |
+| `wrong-password`       | 403    | Replacing the member's public key without `current_auth_key`, or with a wrong one. |
 | `already-member`       | 409    | The account is in that team already.                           |
 | `not-pending`          | 409    | That member is active already.                                 |
 | `not-active`           | 409    | Only an active member becomes an owner.                        |

@@ -441,24 +441,43 @@ pub fn purge_tombstones(
     before_ms: u64,
     below_seq: u64,
 ) -> rusqlite::Result<usize> {
+    purge_tombstones_in(conn, account.into(), before_ms, below_seq)
+}
+
+/// The same for any mailbox: a team's markers go by the same two conditions,
+/// with `below_seq` from the devices that read that team.
+pub fn purge_tombstones_in(
+    conn: &Connection,
+    mailbox: Mailbox,
+    before_ms: u64,
+    below_seq: u64,
+) -> rusqlite::Result<usize> {
+    let (records, owners, owner) = mailbox.tables();
     let tx = conn.unchecked_transaction()?;
-    let which = params![account.id.to_string(), before_ms as i64, below_seq as i64];
+    let which = params![mailbox.id.to_string(), before_ms as i64, below_seq as i64];
     let (count, bytes): (i64, i64) = tx.query_row(
-        "SELECT count(*), coalesce(sum(length(blob)), 0) FROM records
-          WHERE account_id = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3",
+        &format!(
+            "SELECT count(*), coalesce(sum(length(blob)), 0) FROM {records}
+              WHERE {owner} = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3"
+        ),
         which,
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let removed = tx.execute(
-        "DELETE FROM records
-          WHERE account_id = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3",
+        &format!(
+            "DELETE FROM {records}
+              WHERE {owner} = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3"
+        ),
         which,
     )?;
     tx.execute(
-        "UPDATE accounts
-            SET record_count = max(record_count - ?2, 0), record_bytes = max(record_bytes - ?3, 0)
-          WHERE id = ?1",
-        params![account.id.to_string(), count, bytes],
+        &format!(
+            "UPDATE {owners}
+                SET record_count = max(record_count - ?2, 0),
+                    record_bytes = max(record_bytes - ?3, 0)
+              WHERE id = ?1"
+        ),
+        params![mailbox.id.to_string(), count, bytes],
     )?;
     tx.commit()?;
     Ok(removed)

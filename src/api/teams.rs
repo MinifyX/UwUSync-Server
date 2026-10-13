@@ -158,6 +158,10 @@ pub struct PutIdentity {
     pub sealed_private: String,
     #[serde(default)]
     pub replace: bool,
+    /// The account's login key, as a password change sends it. Needed when
+    /// `replace` puts another public key in place of the one there is.
+    #[serde(default)]
+    pub current_auth_key: Option<String>,
 }
 
 pub async fn identity(
@@ -182,12 +186,28 @@ pub async fn put_identity(
         teams::MAX_SEALED_PRIVATE_BYTES,
         "a sealed private key",
     )?;
+    // Another public key in place of the one there is takes the account out
+    // of its teams until somebody lets it in again, and decides which key
+    // they are asked to trust. That is the account holder's to do, not a
+    // device's: whoever holds a stolen laptop has its token. So it takes the
+    // master password, proved as a password change proves it.
+    let another = request.replace
+        && teams::identity(&state.db.lock(), auth.account.id)?
+            .is_some_and(|held| held.public_key != public);
+    if another {
+        let key = request
+            .current_auth_key
+            .as_deref()
+            .ok_or(ApiError::WrongPassword)?;
+        super::prove_password(&state, &auth, &super::auth_key(key)?)?;
+    }
     let stored = teams::put_identity(
         &mut state.db.lock(),
         auth.account.id,
         &public,
         &sealed,
         request.replace,
+        another,
         state.clock.now_ms(),
     )?;
     if !stored.waiting_in.is_empty() {
@@ -684,6 +704,10 @@ pub async fn pull(
         let standing = teams::active(&conn, team, auth.account.id)?;
         let page =
             records::pull_from(&conn, Mailbox::team(team), query.cursor, limit, Reader::ALL)?;
+        // How far this device has read, for forgetting old markers — never
+        // further than there is. A device that names a cursor beyond what it
+        // read moves only its own mark, and so misses only its own markers.
+        teams::seen(&conn, team, auth.device.id, page.cursor.0.min(standing.seq))?;
         TeamPull {
             page,
             epoch: standing.epoch,

@@ -17,7 +17,7 @@ use crate::db::invites::{code, hash};
 use crate::db::records::{self, Mailbox, Quota};
 use crate::wire::{Envelope, PushResponse};
 use crate::{ApiError, Result, TeamError};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -271,12 +271,18 @@ pub struct Stored {
 /// identity: every team key wrapped to the old one is dropped, and the
 /// account waits in each of its teams until somebody who manages the team
 /// has checked the new key and wrapped the team key to it.
+///
+/// `proved` says whether the request came with the master password. A new
+/// public key is only taken from one that did: a device's token alone must
+/// not be enough to take an account out of the reach of its teams, and to
+/// put a key of somebody else's choosing in front of those who confirm.
 pub fn put_identity(
     conn: &mut Connection,
     account: Uuid,
     public_key: &[u8],
     sealed_private: &[u8],
     replace: bool,
+    proved: bool,
     now: u64,
 ) -> Result<Stored> {
     let tx = conn.transaction()?;
@@ -290,6 +296,12 @@ pub fn put_identity(
             });
         }
         Some(_) if !replace => return Err(TeamError::IdentityExists.into()),
+        // Only when another device put a key there between this request's
+        // look and its write: it is told there is one now, as it would have
+        // been a moment later.
+        Some(held) if held.public_key != public_key && !proved => {
+            return Err(TeamError::IdentityExists.into())
+        }
         Some(held) => {
             if held.public_key != public_key {
                 {
@@ -457,8 +469,21 @@ pub fn rename(conn: &Connection, team: Uuid, by: Uuid, name: &str) -> Result<()>
 
 /// Take a team away with everything it holds, whoever asks. Returns whether
 /// there was one.
+///
+/// In one transaction that takes the database for itself from the start:
+/// this is what the command line runs beside a server that is serving, and
+/// a push must find either the whole team or none of it.
 pub fn delete_any(conn: &Connection, team: Uuid) -> rusqlite::Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let gone = delete_rows(&tx, team)?;
+    tx.commit()?;
+    Ok(gone)
+}
+
+/// The rows of a team, inside the caller's transaction.
+fn delete_rows(conn: &Connection, team: Uuid) -> rusqlite::Result<bool> {
     let id = team.to_string();
+    conn.execute("DELETE FROM team_cursors WHERE team_id = ?1", [&id])?;
     conn.execute("DELETE FROM team_records WHERE team_id = ?1", [&id])?;
     conn.execute("DELETE FROM team_invites WHERE team_id = ?1", [&id])?;
     conn.execute("DELETE FROM team_members WHERE team_id = ?1", [&id])?;
@@ -475,7 +500,7 @@ pub fn delete(conn: &mut Connection, team: Uuid, by: Uuid) -> Result<Vec<Uuid>> 
         return Err(TeamError::Forbidden.into());
     }
     let members = accounts_of(&tx, team)?;
-    delete_any(&tx, team)?;
+    delete_rows(&tx, team)?;
     tx.commit()?;
     Ok(members)
 }
@@ -743,6 +768,31 @@ fn another_owner(conn: &Connection, team: Uuid, target: Uuid, state: MemberState
     Ok(others > 0)
 }
 
+/// Invites live as long as whoever made them may invite: one made by a
+/// member who was taken out, or who no longer manages the team, lets nobody
+/// in any more.
+fn drop_invites_of(conn: &Connection, team: Uuid, account: Uuid) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM team_invites WHERE team_id = ?1 AND created_by = ?2",
+        params![team.to_string(), account.to_string()],
+    )
+}
+
+/// How far an account's devices had read a team — or every team — is
+/// forgotten with its membership: back in, they start from the beginning.
+fn forget_cursors_of(
+    conn: &Connection,
+    team: Option<Uuid>,
+    account: Uuid,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM team_cursors
+          WHERE (?1 IS NULL OR team_id = ?1)
+            AND device_id IN (SELECT id FROM devices WHERE account_id = ?2)",
+        params![team.map(|team| team.to_string()), account.to_string()],
+    )
+}
+
 /// Change what a member may do.
 ///
 /// Whoever manages the team may; making an owner, or making an owner
@@ -774,6 +824,9 @@ pub fn set_role(
         "UPDATE team_members SET role = ?3 WHERE team_id = ?1 AND account_id = ?2",
         params![team.to_string(), target.to_string(), role.as_str()],
     )?;
+    if !role.manages() {
+        drop_invites_of(&tx, team, target)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -804,6 +857,8 @@ pub fn remove(conn: &mut Connection, team: Uuid, by: Uuid, target: Uuid) -> Resu
         "DELETE FROM team_members WHERE team_id = ?1 AND account_id = ?2",
         params![team.to_string(), target.to_string()],
     )?;
+    drop_invites_of(&tx, team, target)?;
+    forget_cursors_of(&tx, Some(team), target)?;
     if had_key {
         tx.execute(
             "UPDATE teams SET needs_rotation = 1 WHERE id = ?1",
@@ -918,6 +973,44 @@ pub fn push(
     Ok(response)
 }
 
+/// Note how far a device has read a team. Only ever forward.
+pub fn seen(conn: &Connection, team: Uuid, device: Uuid, cursor: u64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO team_cursors (team_id, device_id, cursor) VALUES (?1, ?2, ?3)
+         ON CONFLICT (team_id, device_id) DO UPDATE SET cursor = max(cursor, excluded.cursor)",
+        params![
+            team.to_string(),
+            device.to_string(),
+            i64::try_from(cursor).unwrap_or(i64::MAX)
+        ],
+    )?;
+    Ok(())
+}
+
+/// The lowest cursor among the devices that read this team: those of its
+/// members that are not revoked and have pulled it at least once. A device
+/// that never read the team holds no record a marker would have to stop. 0
+/// while no device has read it.
+pub fn lowest_cursor(conn: &Connection, team: Uuid) -> rusqlite::Result<u64> {
+    let lowest: Option<i64> = conn.query_row(
+        "SELECT min(c.cursor)
+           FROM team_cursors c
+           JOIN devices d ON d.id = c.device_id AND d.revoked_ms IS NULL
+           JOIN team_members m ON m.team_id = c.team_id AND m.account_id = d.account_id
+          WHERE c.team_id = ?1",
+        [team.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(lowest.unwrap_or(0).max(0) as u64)
+}
+
+/// Forget the markers of a team's deleted records that every reading device
+/// has seen and that are older than `before_ms` — as for an account's vault.
+pub fn purge_tombstones(conn: &Connection, team: Uuid, before_ms: u64) -> rusqlite::Result<usize> {
+    let below = lowest_cursor(conn, team)?;
+    records::purge_tombstones_in(conn, Mailbox::team(team), before_ms, below)
+}
+
 // ── For the operator, and for an account that goes ──────────────────────────
 
 /// A team as the operator's list shows it.
@@ -1001,13 +1094,18 @@ pub fn forget_account(conn: &mut Connection, account: Uuid) -> Result<Left> {
         [account.to_string()],
     )?;
     tx.execute(
+        "DELETE FROM team_invites WHERE created_by = ?1",
+        [account.to_string()],
+    )?;
+    forget_cursors_of(&tx, None, account)?;
+    tx.execute(
         "DELETE FROM team_identities WHERE account_id = ?1",
         [account.to_string()],
     )?;
     for (team, had_key) in teams {
         let id = team.to_string();
         if member_count(&tx, team)? == 0 {
-            delete_any(&tx, team)?;
+            delete_rows(&tx, team)?;
             left.deleted.push(team);
             continue;
         }
@@ -1083,6 +1181,40 @@ mod tests {
     }
 
     #[test]
+    fn only_devices_that_still_read_a_team_keep_its_markers() {
+        use crate::db::devices;
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let owner = account(&conn);
+        let other = account(&conn);
+        let team = team_with(&mut conn, owner, &[(other, Role::Reader)]);
+        let device = |of: Uuid, name: &str| devices::add(&conn, of, name, &[1; 32]).unwrap().id;
+        let (ahead, behind, lost) = (
+            device(owner, "ahead"),
+            device(other, "behind"),
+            device(other, "lost"),
+        );
+        assert_eq!(lowest_cursor(&conn, team).unwrap(), 0);
+
+        seen(&conn, team, ahead, 9).unwrap();
+        seen(&conn, team, behind, 4).unwrap();
+        seen(&conn, team, lost, 2).unwrap();
+        assert_eq!(lowest_cursor(&conn, team).unwrap(), 2);
+        // A cursor never goes back.
+        seen(&conn, team, lost, 1).unwrap();
+        assert_eq!(lowest_cursor(&conn, team).unwrap(), 2);
+
+        // A revoked device waits for nothing; neither does a removed member's.
+        assert!(devices::revoke(&conn, other, lost).unwrap());
+        assert_eq!(lowest_cursor(&conn, team).unwrap(), 4);
+        remove(&mut conn, team, owner, other).unwrap();
+        assert_eq!(lowest_cursor(&conn, team).unwrap(), 9);
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM team_cursors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 1);
+    }
+    #[test]
     fn an_account_that_goes_leaves_nothing_behind_and_its_teams_stay_manageable() {
         let db = Db::open_in_memory().unwrap();
         let mut conn = db.lock();
@@ -1147,7 +1279,7 @@ mod tests {
         let owner = accounts::create(&conn, &accounts::tests::header(), b"key")
             .unwrap()
             .id;
-        let first = put_identity(&mut conn, owner, &[1; 32], b"sealed", false, 1).unwrap();
+        let first = put_identity(&mut conn, owner, &[1; 32], b"sealed", false, true, 1).unwrap();
         assert!(first.waiting_in.is_empty());
         let team = create(&mut conn, owner, "ops", "Owner", b"w", &Teams::default(), 1)
             .unwrap()
@@ -1155,14 +1287,17 @@ mod tests {
 
         // Somebody else's pair, without saying replace: the first one stays.
         assert_eq!(
-            team_error(put_identity(&mut conn, owner, &[2; 32], b"other", false, 2)),
+            team_error(put_identity(
+                &mut conn, owner, &[2; 32], b"other", false, true, 2
+            )),
             TeamError::IdentityExists
         );
         // The same pair again is not an error.
-        put_identity(&mut conn, owner, &[1; 32], b"sealed", false, 2).unwrap();
+        put_identity(&mut conn, owner, &[1; 32], b"sealed", false, true, 2).unwrap();
 
         // Sealed again under a new password: still the same identity.
-        let resealed = put_identity(&mut conn, owner, &[1; 32], b"resealed", true, 3).unwrap();
+        let resealed =
+            put_identity(&mut conn, owner, &[1; 32], b"resealed", true, true, 3).unwrap();
         assert!(resealed.waiting_in.is_empty());
         assert_eq!(
             standing(&conn, team, owner).unwrap().state,
@@ -1170,7 +1305,7 @@ mod tests {
         );
 
         // Another key: the team key wrapped to the old one is gone.
-        let replaced = put_identity(&mut conn, owner, &[2; 32], b"new", true, 4).unwrap();
+        let replaced = put_identity(&mut conn, owner, &[2; 32], b"new", true, true, 4).unwrap();
         assert_eq!(replaced.waiting_in, vec![team]);
         let mine = get(&conn, team, owner).unwrap();
         assert_eq!(mine.state, MemberState::Pending);

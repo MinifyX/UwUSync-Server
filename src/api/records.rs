@@ -113,6 +113,10 @@ pub async fn push(
 /// How often an open event stream asks whether its token is still good.
 const RECHECK: Duration = Duration::from_secs(30);
 
+/// What a `team` event carries instead of a team's id when events were
+/// missed: look at every team again.
+pub const ALL_TEAMS: &str = "*";
+
 /// "There is something new from sequence N" — or, as an event named `team`
 /// with the team's id, "look at this team again". Nothing else is ever pushed
 /// out: the device pulls, the same way it would have anyway. The event names no
@@ -157,8 +161,16 @@ pub async fn events(
                             return;
                         }
                     }
-                    // Missed a few: the next one says the same thing better.
-                    Err(RecvError::Lagged(_)) => {}
+                    // Missed a few. For the vault the next one says the same
+                    // thing better; which team a missed one named, nothing
+                    // says any more — so the device is told to look at all
+                    // of them.
+                    Err(RecvError::Lagged(_)) => {
+                        let event = Event::default().event("team").data(ALL_TEAMS);
+                        if sender.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
                     Err(RecvError::Closed) => return,
                 },
                 _ = recheck.tick() => {
