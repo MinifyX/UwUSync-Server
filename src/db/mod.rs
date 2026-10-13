@@ -9,6 +9,7 @@ pub mod accounts;
 pub mod devices;
 pub mod invites;
 pub mod records;
+pub mod teams;
 
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OpenFlags};
@@ -202,36 +203,50 @@ pub fn with_suffix(database: &Path, suffix: &str) -> PathBuf {
 /// devices already read past: they would never pull it. So every account
 /// continues from the highest number it ever handed out, as far as the
 /// replaced database says, and from well past the backup's where it cannot.
+/// The same for every team, which numbers its records on its own.
 fn carry_numbers_forward(database: &Path, replaced: Option<&Path>) -> rusqlite::Result<()> {
-    let mut reached: HashMap<String, i64> = HashMap::new();
-    if let Some(replaced) = replaced {
-        if let Ok(old) = Connection::open_with_flags(replaced, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            if let Ok(mut stmt) = old.prepare("SELECT id, seq FROM accounts") {
-                if let Ok(rows) = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
-                    reached.extend(rows.flatten());
+    let conn = Connection::open(database)?;
+    for table in ["accounts", "teams"] {
+        // A backup from before there were teams has no such table yet; the
+        // server makes it, empty, when it next opens the file.
+        let there: bool = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| Ok(row.get::<_, i64>(0)? > 0),
+        )?;
+        if !there {
+            continue;
+        }
+        let mut reached: HashMap<String, i64> = HashMap::new();
+        if let Some(replaced) = replaced {
+            if let Ok(old) = Connection::open_with_flags(replaced, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            {
+                if let Ok(mut stmt) = old.prepare(&format!("SELECT id, seq FROM {table}")) {
+                    if let Ok(rows) = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+                        reached.extend(rows.flatten());
+                    }
                 }
             }
         }
-    }
-    let conn = Connection::open(database)?;
-    let accounts: Vec<(String, i64)> = conn
-        .prepare("SELECT id, seq FROM accounts")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (id, seq) in accounts {
-        let next = match reached.get(&id) {
-            Some(before) => seq.max(*before),
-            None => seq + RESTORE_GAP,
-        };
-        conn.execute(
-            "UPDATE accounts SET seq = ?2 WHERE id = ?1",
-            params![id, next],
-        )?;
+        let numbered: Vec<(String, i64)> = conn
+            .prepare(&format!("SELECT id, seq FROM {table}"))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, seq) in numbered {
+            let next = match reached.get(&id) {
+                Some(before) => seq.max(*before),
+                None => seq + RESTORE_GAP,
+            };
+            conn.execute(
+                &format!("UPDATE {table} SET seq = ?2 WHERE id = ?1"),
+                params![id, next],
+            )?;
+        }
     }
     Ok(())
 }
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -333,6 +348,103 @@ ALTER TABLE enrolments ADD COLUMN device_id TEXT;
 ALTER TABLE enrolments ADD COLUMN failures INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Teams: a vault several accounts share. The server holds what it holds of an
+/// account's own vault — sealed records it cannot read — and beside them who
+/// belongs to the team, as what, and the team key wrapped once for each member
+/// by a client. See `docs/teams.md`.
+const V4: &str = r#"
+-- The key pair a team key is wrapped to: one per account. The private half
+-- is sealed by the client with a key of the account's own vault.
+CREATE TABLE team_identities (
+    account_id      TEXT    PRIMARY KEY REFERENCES accounts (id),
+    public_key      BLOB    NOT NULL,
+    sealed_private  BLOB    NOT NULL,
+    updated_ms      INTEGER NOT NULL
+);
+
+CREATE TABLE teams (
+    id              TEXT    PRIMARY KEY,
+    -- Not sealed: the operator's list of teams shows it.
+    name            TEXT    NOT NULL,
+    created_ms      INTEGER NOT NULL,
+    -- Which team key is the current one. Every record held was pushed under
+    -- it: a rotation takes the records of the epoch before along.
+    epoch           INTEGER NOT NULL DEFAULT 1,
+    -- Somebody who knew the current key is not a member any more.
+    needs_rotation  INTEGER NOT NULL DEFAULT 0,
+    -- As for an account: the last number handed out, never reused, and never
+    -- set back — not by a rotation either.
+    seq             INTEGER NOT NULL DEFAULT 0,
+    record_count    INTEGER NOT NULL DEFAULT 0,
+    record_bytes    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE team_members (
+    team_id         TEXT    NOT NULL REFERENCES teams (id),
+    account_id      TEXT    NOT NULL REFERENCES accounts (id),
+    display_name    TEXT    NOT NULL,
+    -- owner, admin, editor, reader
+    role            TEXT    NOT NULL,
+    -- pending until a member who manages the team has wrapped the team key
+    -- for this one; active from then on.
+    state           TEXT    NOT NULL,
+    -- The team key of the current epoch, wrapped to this member's public
+    -- key. Never there while pending.
+    wrapped_key     BLOB,
+    -- Whether this member was ever handed the key of the current epoch.
+    -- Taking such a member out is what calls for a rotation.
+    had_key         INTEGER NOT NULL DEFAULT 0,
+    joined_ms       INTEGER NOT NULL,
+    PRIMARY KEY (team_id, account_id)
+);
+
+CREATE INDEX team_members_by_account ON team_members (account_id);
+
+CREATE TABLE team_invites (
+    id              TEXT    PRIMARY KEY,
+    team_id         TEXT    NOT NULL REFERENCES teams (id),
+    -- SHA-256 of the code. The code itself is shown once and kept nowhere.
+    code_hash       BLOB    NOT NULL UNIQUE,
+    role            TEXT    NOT NULL,
+    created_by      TEXT    NOT NULL,
+    created_ms      INTEGER NOT NULL,
+    expires_ms      INTEGER NOT NULL,
+    used_ms         INTEGER
+);
+
+CREATE INDEX team_invites_by_team ON team_invites (team_id);
+
+-- The records table once more, for what belongs to a team instead of an
+-- account. Two tables rather than one with two kinds of owner, so that no
+-- query for one can ever answer with the other's.
+CREATE TABLE team_records (
+    team_id         TEXT    NOT NULL REFERENCES teams (id),
+    id              TEXT    NOT NULL,
+    kind            TEXT    NOT NULL,
+    seq             INTEGER NOT NULL,
+    hlc_wall_ms     INTEGER NOT NULL,
+    hlc_counter     INTEGER NOT NULL,
+    hlc_device      INTEGER NOT NULL,
+    deleted         INTEGER NOT NULL DEFAULT 0,
+    nonce           BLOB    NOT NULL,
+    blob            BLOB    NOT NULL,
+    device_id       TEXT,
+    updated_ms      INTEGER NOT NULL,
+    PRIMARY KEY (team_id, id)
+);
+
+CREATE INDEX team_records_by_seq ON team_records (team_id, seq);
+
+-- How far each device has read each team: what says when a deleted record's
+-- marker has been seen by every device that could bring the record back.
+CREATE TABLE team_cursors (
+    team_id         TEXT    NOT NULL REFERENCES teams (id),
+    device_id       TEXT    NOT NULL REFERENCES devices (id),
+    cursor          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (team_id, device_id)
+);
+"#;
+
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -372,6 +484,13 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.commit()?;
         tracing::info!("database migrated to schema 3");
     }
+    if version < 4 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(V4)?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+        tracing::info!("database migrated to schema 4");
+    }
     Ok(())
 }
 
@@ -407,7 +526,76 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 5);
+        assert_eq!(tables, 11);
+    }
+
+    /// A database as 0.2 left it — schema 3, with an account and a record —
+    /// is taken as it is: what was there stays, and the tables for teams come
+    /// beside it.
+    #[test]
+    fn a_database_from_before_teams_is_upgraded_where_it_lies() {
+        let dir = scratch();
+        let path = dir.join("uwusync.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1).unwrap();
+            conn.execute_batch(V2).unwrap();
+            conn.execute_batch(V3).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO accounts
+                    (id, created_ms, vault_id, kdf_memory_kib, kdf_time_cost, kdf_parallelism,
+                     salt, wrapped_nonce, wrapped_blob, auth_verifier, seq,
+                     record_count, record_bytes)
+                 VALUES ('a', 1, 'v', 1, 1, 1, x'00', x'00', x'00', x'00', 7, 1, 3)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO records
+                    (account_id, id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device,
+                     nonce, blob, updated_ms)
+                 VALUES ('a', 'r', 'host', 7, 1, 0, 1, x'00', x'010203', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let conn = db.lock();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (seq, bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT seq, record_bytes FROM accounts WHERE id = 'a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((seq, bytes), (7, 3), "the account is as it was");
+        let records: i64 = conn
+            .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, 1);
+        for table in [
+            "team_identities",
+            "teams",
+            "team_members",
+            "team_invites",
+            "team_records",
+        ] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        drop(conn);
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn scratch() -> std::path::PathBuf {

@@ -120,6 +120,60 @@ sudo docker compose exec uwusync uwusync-server revoke <device>
 A revoked device stops syncing at once. What it already has, it keeps: rotate
 the keys and passwords it held.
 
+### Teams
+
+A team is a vault that several accounts on this server share: its members
+invite each other, and each record is sealed with a key only they have. The
+server stores a team the way it stores an account's vault — it cannot read a
+record. What it does keep in plain text is a team's name, the name each member
+goes by in it, and who is in it in which role. Teams need a client that knows
+them; older ones carry on as before.
+
+Four settings, all in `.env`:
+
+| Variable                        | Default | What it does                                              |
+| ------------------------------- | ------- | --------------------------------------------------------- |
+| `UWUSYNC_TEAMS`                 | `on`    | `off`: no teams on this server. What there is stays in the database, out of reach, until it is `on` again |
+| `UWUSYNC_TEAM_CREATION`         | `all`   | `all`: every account may create teams. `none`: nobody may; the teams there are go on working, invites included |
+| `UWUSYNC_MAX_TEAMS_PER_ACCOUNT` | `10`    | How many teams one account may be in, created or joined   |
+| `UWUSYNC_MAX_TEAM_MEMBERS`      | `50`    | Members of one team, 1 to 1000                            |
+
+A team may hold what one account may hold (`UWUSYNC_ACCOUNT_MAX_RECORDS`,
+`UWUSYNC_ACCOUNT_MAX_MB`), each team for itself and beside its members' own
+vaults. So an account's ceiling is its own vault plus that of every team it
+creates; what keeps the disk safe is `UWUSYNC_SERVER_MAX_MB`, which counts
+accounts and teams together. On a server for more than friends, lower
+`UWUSYNC_MAX_TEAMS_PER_ACCOUNT` or set `UWUSYNC_TEAM_CREATION=none` once the
+teams you want exist.
+
+Lowering a limit takes nothing away: a team with more members than the new
+limit keeps them and takes no new ones.
+
+Teams are run from the app. From here you can look, and settle what the app
+cannot:
+
+```bash
+sudo docker compose exec uwusync uwusync-server teams
+sudo docker compose exec uwusync uwusync-server team-delete <team>
+sudo docker compose exec uwusync uwusync-server team-owner <team> <account>
+```
+
+- `teams` lists them: id, name, members, records, and the day it was made.
+- `team-delete` deletes one with everything in it. Its members keep their
+  accounts and their own vaults, and their devices drop the team at their next
+  sync. There is no way back but a backup.
+- `team-owner` makes a member an owner. It is for a team left without one —
+  `teams` marks those — and only takes a member who has the team's key: the
+  server has no key to give. Ids of accounts are in `uwusync-server accounts`.
+
+A team key is the members' alone. If every member has lost it, the server
+cannot help; `team-delete` is what is left.
+
+Restoring a backup takes teams back with everything else: members removed
+since are members again, and a key rotated since is the old one again. After a
+restore, whoever runs a team should check its members and rotate its key in the
+app.
+
 ## The address
 
 `UWUSYNC_PUBLIC` is how a device dials this server, and it goes into every setup

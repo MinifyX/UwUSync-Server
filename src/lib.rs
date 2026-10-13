@@ -31,7 +31,7 @@ pub mod updates;
 pub mod wire;
 
 pub use config::Config;
-pub use error::{ApiError, Result};
+pub use error::{ApiError, Result, TeamError};
 pub use state::AppState;
 
 /// Milliseconds since the Unix epoch.

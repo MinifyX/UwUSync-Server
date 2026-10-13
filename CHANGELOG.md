@@ -3,6 +3,41 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
+## 0.3.0
+
+**Teams.** A team is a vault that several accounts share: hosts, keys and snippets a group works
+with together, sealed with a key only its members have. The server stores a team the way it
+stores an account's own vault and can read as little of it. It needs a client that knows teams;
+older ones sync as before. The protocol is in [docs/teams.md](docs/teams.md), what an operator
+sets in [docs/deployment.md](docs/deployment.md#teams).
+
+- **Four roles.** An owner does everything, an admin everything but touch owners or delete the
+  team, an editor reads and writes records, a reader reads. A team always keeps an owner.
+- **Nobody gets in on a code alone.** An invite is good for a week and for one account, and makes
+  a member who waits: they see nothing of the team until an owner or admin has confirmed them and
+  handed them the team key, wrapped to their own. The server keeps a hash of the code, and counts
+  wrong guesses.
+- **Out means out.** A removed member is refused from the next request on, and the team says that
+  its key wants changing. Rotating gives every remaining member a new key in one step and drops
+  everything sealed under the old one; a push under an old key is refused.
+- **Yours to switch off.** `UWUSYNC_TEAMS=off` for no teams, `UWUSYNC_TEAM_CREATION=none` for no
+  new ones, `UWUSYNC_MAX_TEAMS_PER_ACCOUNT` and `UWUSYNC_MAX_TEAM_MEMBERS` for how many. A team
+  may hold what one account may hold, and `UWUSYNC_SERVER_MAX_MB` now counts accounts and teams
+  together.
+- **Three commands.** `uwusync-server teams` lists them, `team-delete` deletes one, and
+  `team-owner` gives a team that lost its owner a new one.
+- What the server reads of a team is its name, the name each member goes by in it, and who is in
+  it in which role. The database is upgraded in place at the first start; a backup from 0.2 can
+  be restored into 0.3, not the other way round.
+- `GET /v1/events` has a second event beside `records`: `team`, with a team's id, when one of the
+  account's teams changed — or with `*` when the stream fell behind and the client should look at
+  all of them.
+- A device replaces its account's member key only with the master password, as it changes the
+  password or revokes a device only with it. An invite stops working when the member who made it
+  is removed or may no longer invite. The nightly cleanup forgets the markers of deleted team
+  records as it does an account's: after 90 days, once every device that reads the team has seen
+  them.
+
 ## 0.2.2
 
 **The command assistant's records, for UwUSSH 0.3.** UwUSSH 0.3 syncs the settings of its command

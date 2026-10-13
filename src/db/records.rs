@@ -42,17 +42,73 @@ impl Default for Quota {
     }
 }
 
+/// Whose records these are: an account's own vault, or a team's. Both are the
+/// same mailbox — numbered, paged and checked by the same code — kept in two
+/// pairs of tables, so that nothing of a team is ever in an account's answer
+/// and the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mailbox {
+    /// The account, or the team.
+    pub id: Uuid,
+    /// The vault every record in it names: the account's vault, or — for a
+    /// team — the team itself.
+    pub vault_id: Uuid,
+    team: bool,
+}
+
+impl Mailbox {
+    /// The mailbox of a team. Who may read or write it is the caller's to
+    /// have checked: see [`crate::db::teams`].
+    pub fn team(id: Uuid) -> Self {
+        Self {
+            id,
+            vault_id: id,
+            team: true,
+        }
+    }
+
+    /// The table the records are in, the table that counts them, and the
+    /// column that says whose they are. Names from here and nowhere else:
+    /// none of them ever comes from a request.
+    fn tables(&self) -> (&'static str, &'static str, &'static str) {
+        if self.team {
+            ("team_records", "teams", "team_id")
+        } else {
+            ("records", "accounts", "account_id")
+        }
+    }
+
+    fn what(&self) -> &'static str {
+        if self.team {
+            "team"
+        } else {
+            "account"
+        }
+    }
+}
+
+impl From<&Account> for Mailbox {
+    fn from(account: &Account) -> Self {
+        Self {
+            id: account.id,
+            vault_id: account.vault_id,
+            team: false,
+        }
+    }
+}
+
 /// An XChaCha20-Poly1305 nonce, as every envelope carries.
 const NONCE_BYTES: usize = 24;
 
 /// Everything about an envelope the server can check without a key: that it
-/// belongs to this account's vault, that it is shaped like an envelope, and
+/// belongs to this mailbox's vault, that it is shaped like an envelope, and
 /// that it is not big enough to be a problem.
-fn check(account: &Account, envelope: &Envelope) -> Result<()> {
-    if envelope.vault_id != account.vault_id {
-        return Err(ApiError::Invalid(
-            "a record from another vault than this account's".into(),
-        ));
+fn check(mailbox: Mailbox, envelope: &Envelope) -> Result<()> {
+    if envelope.vault_id != mailbox.vault_id {
+        return Err(ApiError::Invalid(format!(
+            "a record from another vault than this {}'s",
+            mailbox.what()
+        )));
     }
     if envelope.nonce.len() != NONCE_BYTES {
         return Err(ApiError::Invalid("a record without a proper nonce".into()));
@@ -97,6 +153,25 @@ pub fn push_within(
     envelopes: &[Envelope],
     quota: Quota,
 ) -> Result<PushResponse> {
+    let tx = conn.transaction()?;
+    let response = push_in(&tx, account.into(), device, envelopes, quota)?;
+    tx.commit()?;
+    Ok(response)
+}
+
+/// What a push does, inside a transaction that is the caller's to commit —
+/// so whatever decided that this push is allowed (for a team: that the device
+/// is a member who may write, at the epoch it names) is decided in the same
+/// transaction as the push itself. Dropping the transaction after an error
+/// takes back everything.
+pub fn push_in(
+    tx: &Connection,
+    mailbox: Mailbox,
+    device: Uuid,
+    envelopes: &[Envelope],
+    quota: Quota,
+) -> Result<PushResponse> {
+    let (records_table, owners, owner) = mailbox.tables();
     if envelopes.len() > MAX_BATCH {
         return Err(ApiError::TooLarge(format!(
             "{} records in one request, at most {MAX_BATCH} are allowed",
@@ -110,13 +185,12 @@ pub fn push_within(
         )));
     }
     for envelope in envelopes {
-        check(account, envelope)?;
+        check(mailbox, envelope)?;
     }
 
-    let tx = conn.transaction()?;
     let (mut seq, held_records, held_bytes): (i64, i64, i64) = tx.query_row(
-        "SELECT seq, record_count, record_bytes FROM accounts WHERE id = ?1",
-        [account.id.to_string()],
+        &format!("SELECT seq, record_count, record_bytes FROM {owners} WHERE id = ?1"),
+        [mailbox.id.to_string()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let (mut records, mut bytes) = (held_records, held_bytes);
@@ -125,8 +199,10 @@ pub fn push_within(
     for envelope in envelopes {
         let current: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT seq, length(blob) FROM records WHERE account_id = ?1 AND id = ?2",
-                params![account.id.to_string(), envelope.id.to_string()],
+                &format!(
+                    "SELECT seq, length(blob) FROM {records_table} WHERE {owner} = ?1 AND id = ?2"
+                ),
+                params![mailbox.id.to_string(), envelope.id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -135,7 +211,7 @@ pub fn push_within(
         // thought it was based on: there is nothing here to conflict with.
         if let Some((current, _)) = current {
             if current as u64 != envelope.base_seq {
-                if let Some(held) = get(&tx, account, envelope.id)? {
+                if let Some(held) = get_in(tx, mailbox, envelope.id)? {
                     response.conflicts.push(held);
                 }
                 continue;
@@ -151,18 +227,20 @@ pub fn push_within(
 
         seq += 1;
         tx.execute(
-            "INSERT INTO records
-                (account_id, id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device,
-                 deleted, nonce, blob, device_id, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT (account_id, id) DO UPDATE SET
-                kind = excluded.kind, seq = excluded.seq,
-                hlc_wall_ms = excluded.hlc_wall_ms, hlc_counter = excluded.hlc_counter,
-                hlc_device = excluded.hlc_device, deleted = excluded.deleted,
-                nonce = excluded.nonce, blob = excluded.blob,
-                device_id = excluded.device_id, updated_ms = excluded.updated_ms",
+            &format!(
+                "INSERT INTO {records_table}
+                    ({owner}, id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device,
+                     deleted, nonce, blob, device_id, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT ({owner}, id) DO UPDATE SET
+                    kind = excluded.kind, seq = excluded.seq,
+                    hlc_wall_ms = excluded.hlc_wall_ms, hlc_counter = excluded.hlc_counter,
+                    hlc_device = excluded.hlc_device, deleted = excluded.deleted,
+                    nonce = excluded.nonce, blob = excluded.blob,
+                    device_id = excluded.device_id, updated_ms = excluded.updated_ms"
+            ),
             params![
-                account.id.to_string(),
+                mailbox.id.to_string(),
                 envelope.id.to_string(),
                 envelope.kind.as_str(),
                 seq,
@@ -187,17 +265,19 @@ pub fn push_within(
     {
         // Dropping the transaction takes back everything above.
         return Err(ApiError::TooLarge(format!(
-            "this account holds as much as this server allows ({} records, {} MiB)",
+            "this {} holds as much as this server allows ({} records, {} MiB)",
+            mailbox.what(),
             quota.records,
             quota.bytes / (1024 * 1024)
         )));
     }
     if bytes > held_bytes {
-        // Every account but this one as it was, and this one as it would be.
-        // Read inside the transaction, so two accounts pushing at once cannot
-        // both squeeze under the line.
+        // Every account and team but this one as it was, and this one as it
+        // would be. Read inside the transaction, so two pushing at once
+        // cannot both squeeze under the line.
         let everyone: i64 = tx.query_row(
-            "SELECT coalesce(sum(record_bytes), 0) FROM accounts",
+            "SELECT (SELECT coalesce(sum(record_bytes), 0) FROM accounts)
+                  + (SELECT coalesce(sum(record_bytes), 0) FROM teams)",
             [],
             |row| row.get(0),
         )?;
@@ -207,16 +287,18 @@ pub fn push_within(
                 "the server holds as much as it is allowed to; pushes that add are refused"
             );
             return Err(ApiError::TooLarge(format!(
-                "this server holds as much as it allows ({} MiB for all accounts together)",
+                "this server holds as much as it allows ({} MiB for all accounts and teams \
+                 together)",
                 quota.server_bytes / (1024 * 1024)
             )));
         }
     }
     tx.execute(
-        "UPDATE accounts SET seq = ?2, record_count = ?3, record_bytes = ?4 WHERE id = ?1",
-        params![account.id.to_string(), seq, records, bytes],
+        &format!(
+            "UPDATE {owners} SET seq = ?2, record_count = ?3, record_bytes = ?4 WHERE id = ?1"
+        ),
+        params![mailbox.id.to_string(), seq, records, bytes],
     )?;
-    tx.commit()?;
 
     response.cursor = SyncCursor(seq as u64);
     Ok(response)
@@ -244,17 +326,31 @@ pub fn pull(
     limit: usize,
     reader: Reader,
 ) -> Result<PullResponse> {
+    pull_from(conn, account.into(), since, limit, reader)
+}
+
+/// [`pull`], from an account's mailbox or a team's.
+pub fn pull_from(
+    conn: &Connection,
+    mailbox: Mailbox,
+    since: u64,
+    limit: usize,
+    reader: Reader,
+) -> Result<PullResponse> {
+    let (records_table, _, owner) = mailbox.tables();
     let limit = limit.clamp(1, MAX_BATCH);
     // No LIMIT in SQL: rows passed over don't count towards the page, and the
     // loop stops reading once the page is full.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device, deleted, nonce, blob
-           FROM records
-          WHERE account_id = ?1 AND seq > ?2
-          ORDER BY seq",
-    )?;
-    let rows = stmt.query_map(params![account.id.to_string(), since as i64], |row| {
-        row_to_envelope(account, row)
+           FROM {records_table}
+          WHERE {owner} = ?1 AND seq > ?2
+          ORDER BY seq"
+    ))?;
+    // A cursor from beyond what SQLite counts to is past everything.
+    let after = i64::try_from(since).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(params![mailbox.id.to_string(), after], |row| {
+        row_to_envelope(mailbox, row)
     })?;
     let mut envelopes = Vec::new();
     let mut bytes = 0;
@@ -286,17 +382,24 @@ pub fn pull(
 
 /// One record as the server holds it.
 pub fn get(conn: &Connection, account: &Account, id: Uuid) -> Result<Option<Envelope>> {
+    get_in(conn, account.into(), id)
+}
+
+fn get_in(conn: &Connection, mailbox: Mailbox, id: Uuid) -> Result<Option<Envelope>> {
+    let (records_table, _, owner) = mailbox.tables();
     Ok(conn
         .query_row(
-            "SELECT id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device, deleted, nonce, blob
-               FROM records WHERE account_id = ?1 AND id = ?2",
-            params![account.id.to_string(), id.to_string()],
-            |row| row_to_envelope(account, row),
+            &format!(
+                "SELECT id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device, deleted, nonce, blob
+                   FROM {records_table} WHERE {owner} = ?1 AND id = ?2"
+            ),
+            params![mailbox.id.to_string(), id.to_string()],
+            |row| row_to_envelope(mailbox, row),
         )
         .optional()?)
 }
 
-fn row_to_envelope(account: &Account, row: &rusqlite::Row<'_>) -> rusqlite::Result<Envelope> {
+fn row_to_envelope(mailbox: Mailbox, row: &rusqlite::Row<'_>) -> rusqlite::Result<Envelope> {
     let id: String = row.get(0)?;
     let kind = Kind::stored(row.get(1)?);
     let seq: i64 = row.get(2)?;
@@ -305,7 +408,7 @@ fn row_to_envelope(account: &Account, row: &rusqlite::Row<'_>) -> rusqlite::Resu
     let device: i64 = row.get(5)?;
     Ok(Envelope {
         id: Uuid::parse_str(&id).unwrap_or(Uuid::nil()),
-        vault_id: account.vault_id,
+        vault_id: mailbox.vault_id,
         kind,
         updated_at: uwussh_proto::Hlc::new(wall as u64, counter as u32, device as u32),
         base_seq: seq as u64,
@@ -338,24 +441,43 @@ pub fn purge_tombstones(
     before_ms: u64,
     below_seq: u64,
 ) -> rusqlite::Result<usize> {
+    purge_tombstones_in(conn, account.into(), before_ms, below_seq)
+}
+
+/// The same for any mailbox: a team's markers go by the same two conditions,
+/// with `below_seq` from the devices that read that team.
+pub fn purge_tombstones_in(
+    conn: &Connection,
+    mailbox: Mailbox,
+    before_ms: u64,
+    below_seq: u64,
+) -> rusqlite::Result<usize> {
+    let (records, owners, owner) = mailbox.tables();
     let tx = conn.unchecked_transaction()?;
-    let which = params![account.id.to_string(), before_ms as i64, below_seq as i64];
+    let which = params![mailbox.id.to_string(), before_ms as i64, below_seq as i64];
     let (count, bytes): (i64, i64) = tx.query_row(
-        "SELECT count(*), coalesce(sum(length(blob)), 0) FROM records
-          WHERE account_id = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3",
+        &format!(
+            "SELECT count(*), coalesce(sum(length(blob)), 0) FROM {records}
+              WHERE {owner} = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3"
+        ),
         which,
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let removed = tx.execute(
-        "DELETE FROM records
-          WHERE account_id = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3",
+        &format!(
+            "DELETE FROM {records}
+              WHERE {owner} = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3"
+        ),
         which,
     )?;
     tx.execute(
-        "UPDATE accounts
-            SET record_count = max(record_count - ?2, 0), record_bytes = max(record_bytes - ?3, 0)
-          WHERE id = ?1",
-        params![account.id.to_string(), count, bytes],
+        &format!(
+            "UPDATE {owners}
+                SET record_count = max(record_count - ?2, 0),
+                    record_bytes = max(record_bytes - ?3, 0)
+              WHERE id = ?1"
+        ),
+        params![mailbox.id.to_string(), count, bytes],
     )?;
     tx.commit()?;
     Ok(removed)

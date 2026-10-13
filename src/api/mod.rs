@@ -5,6 +5,7 @@ pub mod devices;
 pub mod pairing;
 pub mod records;
 pub mod session;
+pub mod teams;
 
 use crate::auth::Authenticated;
 use crate::db;
@@ -14,7 +15,7 @@ use crate::{b64, ApiError, Result};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -74,6 +75,41 @@ pub fn router(state: AppState) -> Router {
             get(pairing::read)
                 .post(pairing::post)
                 .delete(pairing::close),
+        )
+        .route("/v1/teams/policy", get(teams::policy))
+        .route(
+            "/v1/teams/identity",
+            get(teams::identity).put(teams::put_identity),
+        )
+        .route("/v1/teams", get(teams::list).post(teams::create))
+        .route("/v1/teams/join", post(teams::join))
+        .route("/v1/teams/{id}", patch(teams::rename).delete(teams::delete))
+        .route(
+            "/v1/teams/{id}/invites",
+            get(teams::invites).post(teams::create_invite),
+        )
+        .route(
+            "/v1/teams/{id}/invites/{invite_id}",
+            delete(teams::revoke_invite),
+        )
+        .route("/v1/teams/{id}/members", get(teams::members))
+        .route(
+            "/v1/teams/{id}/members/{account_id}",
+            patch(teams::set_role).delete(teams::remove),
+        )
+        .route(
+            "/v1/teams/{id}/members/{account_id}/confirm",
+            post(teams::confirm),
+        )
+        .route(
+            "/v1/teams/{id}/rotate",
+            post(teams::rotate).layer(DefaultBodyLimit::max(teams::ROTATE_BODY_BYTES)),
+        )
+        .route(
+            "/v1/teams/{id}/records",
+            get(teams::pull)
+                .post(teams::push)
+                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         // Only the routes above have a deadline: a layer reaches the routes
         // that are there when it is added.

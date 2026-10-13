@@ -1455,3 +1455,1526 @@ async fn a_session_nobody_opened_is_not_there_and_not_everyones_to_close() {
         200
     );
 }
+
+/// Teams: a vault several accounts share, and every rule the server keeps
+/// about one. The keys here are stand-ins — the server never opens one.
+mod teams {
+    use super::*;
+    use serde_json::Value;
+    use uwusync_server::config::{TeamCreation, Teams};
+
+    const WEEK_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+    /// 32 bytes that stand for a public key.
+    fn key(seed: u8) -> String {
+        uwusync_server::b64::encode([seed; 32])
+    }
+
+    /// Bytes that stand for a team key wrapped to somebody.
+    fn wrapped(text: &str) -> String {
+        uwusync_server::b64::encode(text.as_bytes())
+    }
+
+    async fn call(
+        server: &Server,
+        device: &Device,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut request = server
+            .client
+            .request(method, server.url(path))
+            .bearer_auth(&device.token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    async fn get(server: &Server, device: &Device, path: &str) -> (u16, Value) {
+        call(server, device, reqwest::Method::GET, path, None).await
+    }
+
+    async fn post(server: &Server, device: &Device, path: &str, body: Value) -> (u16, Value) {
+        call(server, device, reqwest::Method::POST, path, Some(body)).await
+    }
+
+    async fn patch(server: &Server, device: &Device, path: &str, body: Value) -> (u16, Value) {
+        call(server, device, reqwest::Method::PATCH, path, Some(body)).await
+    }
+
+    async fn delete(server: &Server, device: &Device, path: &str) -> (u16, Value) {
+        call(server, device, reqwest::Method::DELETE, path, None).await
+    }
+
+    /// What a refusal looks like: its status and its `error`.
+    fn refused(answer: &(u16, Value)) -> (u16, &str) {
+        (answer.0, answer.1["error"].as_str().unwrap_or(""))
+    }
+
+    /// An account with a team identity. Its public key is its seed, 32 times.
+    async fn member(server: &Server, seed: u8) -> Device {
+        let device = Device::create_account(server, "", "master", seed).await;
+        let answer = call(
+            server,
+            &device,
+            reqwest::Method::PUT,
+            "/v1/teams/identity",
+            Some(json!({ "public_key": key(seed), "sealed_private": wrapped("sealed") })),
+        )
+        .await;
+        assert_eq!(answer.0, 200, "{answer:?}");
+        device
+    }
+
+    async fn open() -> Server {
+        start(Registration::Open).await
+    }
+
+    async fn with_teams(teams: Teams) -> Server {
+        start_with(Config {
+            registration: Registration::Open,
+            teams,
+            ..Config::default()
+        })
+        .await
+    }
+
+    async fn team(server: &Server, owner: &Device) -> Uuid {
+        let answer = post(
+            server,
+            owner,
+            "/v1/teams",
+            json!({ "name": "Ops", "display_name": "Olive", "wrapped_key": wrapped("for the owner") }),
+        )
+        .await;
+        assert_eq!(answer.0, 200, "{answer:?}");
+        answer.1["id"].as_str().unwrap().parse().unwrap()
+    }
+
+    async fn invite(server: &Server, by: &Device, team: Uuid, role: &str) -> String {
+        let answer = post(
+            server,
+            by,
+            &format!("/v1/teams/{team}/invites"),
+            json!({ "role": role }),
+        )
+        .await;
+        assert_eq!(answer.0, 200, "{answer:?}");
+        answer.1["code"].as_str().unwrap().to_string()
+    }
+
+    async fn join(server: &Server, device: &Device, code: &str) -> (u16, Value) {
+        post(
+            server,
+            device,
+            "/v1/teams/join",
+            json!({ "code": code, "display_name": "Newcomer" }),
+        )
+        .await
+    }
+
+    async fn confirm(
+        server: &Server,
+        by: &Device,
+        team: Uuid,
+        whom: &Device,
+        seed: u8,
+        epoch: u64,
+    ) -> (u16, Value) {
+        post(
+            server,
+            by,
+            &format!("/v1/teams/{team}/members/{}/confirm", whom.account),
+            json!({ "epoch": epoch, "public_key": key(seed), "wrapped_key": wrapped("for them") }),
+        )
+        .await
+    }
+
+    /// Invite, redeem, confirm: `whom` is in the team as `role`.
+    async fn admit(
+        server: &Server,
+        owner: &Device,
+        team: Uuid,
+        whom: &Device,
+        seed: u8,
+        role: &str,
+    ) {
+        let code = invite(server, owner, team, role).await;
+        let joined = join(server, whom, &code).await;
+        assert_eq!(joined.0, 200, "{joined:?}");
+        assert_eq!(joined.1["state"], "pending");
+        let confirmed = confirm(server, owner, team, whom, seed, 1).await;
+        assert_eq!(confirmed.0, 204, "{confirmed:?}");
+    }
+
+    fn record(team: Uuid, id: Uuid, base_seq: u64, blob: &[u8]) -> Envelope {
+        Envelope {
+            id,
+            vault_id: team,
+            kind: EntityKind::Host,
+            updated_at: Hlc::new(1_700_000_000_000, 0, 1),
+            base_seq,
+            deleted: false,
+            nonce: vec![7; 24],
+            blob: blob.to_vec(),
+            seq: None,
+        }
+    }
+
+    async fn push(
+        server: &Server,
+        device: &Device,
+        team: Uuid,
+        epoch: u64,
+        envelopes: &[Envelope],
+    ) -> (u16, Value) {
+        post(
+            server,
+            device,
+            &format!("/v1/teams/{team}/records"),
+            json!({ "schema": SCHEMA_VERSION, "epoch": epoch, "envelopes": envelopes }),
+        )
+        .await
+    }
+
+    async fn pull(server: &Server, device: &Device, team: Uuid, cursor: u64) -> (u16, Value) {
+        get(
+            server,
+            device,
+            &format!("/v1/teams/{team}/records?cursor={cursor}"),
+        )
+        .await
+    }
+
+    async fn mine(server: &Server, device: &Device) -> Vec<Value> {
+        let answer = get(server, device, "/v1/teams").await;
+        assert_eq!(answer.0, 200, "{answer:?}");
+        answer.1.as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_team_is_read_by_those_let_in_and_by_nobody_else() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let newcomer = member(&server, 2).await;
+        let stranger = member(&server, 3).await;
+
+        let policy = get(&server, &owner, "/v1/teams/policy").await;
+        assert_eq!(
+            policy.1,
+            json!({
+                "enabled": true, "may_create": true,
+                "max_teams_per_account": 10, "max_members_per_team": 50,
+            })
+        );
+
+        let team = team(&server, &owner).await;
+        let listed = mine(&server, &owner).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["role"], "owner");
+        assert_eq!(listed[0]["state"], "active");
+        assert_eq!(listed[0]["epoch"], 1);
+        assert_eq!(listed[0]["wrapped_key"], wrapped("for the owner"));
+        assert_eq!(listed[0]["needs_rotation"], false);
+        assert_eq!(listed[0]["members"], 1);
+
+        let id = Uuid::now_v7();
+        let pushed = push(&server, &owner, team, 1, &[record(team, id, 0, b"sealed")]).await;
+        assert_eq!(pushed.0, 200, "{pushed:?}");
+        assert_eq!(pushed.1["accepted"][0]["seq"], 1);
+        // The owner's own vault is beside it, untouched.
+        assert!(owner.pull(&server, 0).await.envelopes.is_empty());
+
+        // Redeeming an invite makes a member who waits — and reads nothing.
+        let code = invite(&server, &owner, team, "editor").await;
+        let joined = join(&server, &newcomer, &code).await;
+        assert_eq!(
+            joined.1,
+            json!({ "team_id": team, "name": "Ops", "role": "editor", "state": "pending" })
+        );
+        let waiting = mine(&server, &newcomer).await;
+        assert_eq!(waiting[0]["state"], "pending");
+        assert_eq!(waiting[0]["wrapped_key"], Value::Null);
+        let records = format!("/v1/teams/{team}/records");
+        let members = format!("/v1/teams/{team}/members");
+        assert_eq!(
+            refused(&pull(&server, &newcomer, team, 0).await),
+            (403, "membership-pending")
+        );
+        assert_eq!(
+            refused(&get(&server, &newcomer, &members).await),
+            (403, "membership-pending")
+        );
+        assert_eq!(
+            refused(
+                &push(
+                    &server,
+                    &newcomer,
+                    team,
+                    1,
+                    &[record(team, Uuid::now_v7(), 0, b"x")]
+                )
+                .await
+            ),
+            (403, "membership-pending")
+        );
+
+        // The owner sees who waits, and the key to compare.
+        let seen = get(&server, &owner, &members).await.1;
+        assert_eq!(seen.as_array().unwrap().len(), 2);
+        assert_eq!(seen[1]["account_id"], newcomer.account.to_string());
+        assert_eq!(seen[1]["display_name"], "Newcomer");
+        assert_eq!(seen[1]["role"], "editor");
+        assert_eq!(seen[1]["state"], "pending");
+        assert_eq!(seen[1]["public_key"], key(2));
+
+        // A key for another epoch, or wrapped to another key than the
+        // member's, is not stored.
+        let stale = confirm(&server, &owner, team, &newcomer, 2, 2).await;
+        assert_eq!(refused(&stale), (409, "stale-epoch"));
+        assert_eq!(stale.1["epoch"], 1);
+        assert_eq!(
+            refused(&confirm(&server, &owner, team, &newcomer, 9, 1).await),
+            (409, "identity-changed")
+        );
+        // Nobody confirms themselves in.
+        assert_eq!(
+            refused(&confirm(&server, &newcomer, team, &newcomer, 2, 1).await),
+            (403, "membership-pending")
+        );
+        assert_eq!(confirm(&server, &owner, team, &newcomer, 2, 1).await.0, 204);
+        assert_eq!(
+            refused(&confirm(&server, &owner, team, &newcomer, 2, 1).await),
+            (409, "not-pending")
+        );
+
+        let page = pull(&server, &newcomer, team, 0).await;
+        assert_eq!(page.0, 200, "{page:?}");
+        assert_eq!(page.1["envelopes"][0]["id"], id.to_string());
+        assert_eq!(page.1["cursor"], 1);
+        assert_eq!(page.1["has_more"], false);
+        assert_eq!(page.1["epoch"], 1);
+        assert_eq!(page.1["role"], "editor");
+        assert_eq!(page.1["needs_rotation"], false);
+        assert_eq!(
+            mine(&server, &newcomer).await[0]["wrapped_key"],
+            wrapped("for them")
+        );
+
+        // A newer version needs the version it is based on, as everywhere.
+        let conflict = push(&server, &newcomer, team, 1, &[record(team, id, 0, b"mine")]).await;
+        assert_eq!(conflict.1["conflicts"][0]["id"], id.to_string());
+        let newer = push(&server, &newcomer, team, 1, &[record(team, id, 1, b"mine")]).await;
+        assert_eq!(newer.1["accepted"][0]["seq"], 2);
+        // And a record is the team's only if it says so.
+        let foreign = record(newcomer.vault_id, Uuid::now_v7(), 0, b"x");
+        assert_eq!(push(&server, &newcomer, team, 1, &[foreign]).await.0, 400);
+
+        // To anybody else there is no such team — as there is no team at
+        // all under an id that is none.
+        let nowhere = Uuid::now_v7();
+        for path in [
+            records.clone(),
+            members.clone(),
+            format!("/v1/teams/{team}/invites"),
+            format!("/v1/teams/{nowhere}/records"),
+            "/v1/teams/not-an-id/records".to_string(),
+        ] {
+            assert_eq!(
+                refused(&get(&server, &stranger, &path).await),
+                (404, "not-found"),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            refused(
+                &push(
+                    &server,
+                    &stranger,
+                    team,
+                    1,
+                    &[record(team, Uuid::now_v7(), 0, b"x")]
+                )
+                .await
+            ),
+            (404, "not-found")
+        );
+        assert_eq!(
+            refused(
+                &patch(
+                    &server,
+                    &stranger,
+                    &format!("/v1/teams/{team}"),
+                    json!({ "name": "Mine" })
+                )
+                .await
+            ),
+            (404, "not-found")
+        );
+        assert_eq!(
+            refused(&delete(&server, &stranger, &format!("/v1/teams/{team}")).await),
+            (404, "not-found")
+        );
+        assert_eq!(
+            refused(&confirm(&server, &stranger, team, &stranger, 3, 1).await),
+            (404, "not-found")
+        );
+        assert_eq!(
+            refused(
+                &post(
+                    &server,
+                    &stranger,
+                    &format!("/v1/teams/{team}/rotate"),
+                    json!({ "epoch": 2, "keys": [{ "account_id": stranger.account, "wrapped_key": wrapped("k") }] }),
+                )
+                .await
+            ),
+            (404, "not-found")
+        );
+        assert!(mine(&server, &stranger).await.is_empty());
+
+        // Without a token there is nothing here at all.
+        for path in ["/v1/teams/policy", "/v1/teams", "/v1/teams/identity"] {
+            let response = server.client.get(server.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 401, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_role_does_what_it_may_and_no_more() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let admin = member(&server, 2).await;
+        let editor = member(&server, 3).await;
+        let reader = member(&server, 4).await;
+        let waiting = member(&server, 5).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &admin, 2, "admin").await;
+        admit(&server, &owner, team, &editor, 3, "editor").await;
+        // An admin lets people in as well as an owner does.
+        admit(&server, &admin, team, &reader, 4, "reader").await;
+        let code = invite(&server, &admin, team, "reader").await;
+        assert_eq!(join(&server, &waiting, &code).await.0, 200);
+
+        let at = |device: &Device| format!("/v1/teams/{team}/members/{}", device.account);
+        let this = format!("/v1/teams/{team}");
+        let one = || [record(team, Uuid::now_v7(), 0, b"sealed")];
+
+        // Records: a reader reads, an editor writes too.
+        assert_eq!(
+            refused(&push(&server, &reader, team, 1, &one()).await),
+            (403, "forbidden")
+        );
+        assert_eq!(push(&server, &editor, team, 1, &one()).await.0, 200);
+        assert_eq!(pull(&server, &reader, team, 0).await.1["role"], "reader");
+        assert_eq!(
+            pull(&server, &reader, team, 0).await.1["envelopes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Everything about the team itself is for those who manage it.
+        for lesser in [&editor, &reader] {
+            let invites = format!("{this}/invites");
+            let answers = [
+                post(&server, lesser, &invites, json!({ "role": "reader" })).await,
+                get(&server, lesser, &invites).await,
+                patch(&server, lesser, &this, json!({ "name": "Theirs" })).await,
+                patch(&server, lesser, &at(&reader), json!({ "role": "admin" })).await,
+                delete(&server, lesser, &at(&waiting)).await,
+                confirm(&server, lesser, team, &waiting, 5, 1).await,
+                post(
+                    &server,
+                    lesser,
+                    &format!("{this}/rotate"),
+                    json!({ "epoch": 2, "keys": [] }),
+                )
+                .await,
+                delete(&server, lesser, &this).await,
+            ];
+            for answer in &answers {
+                assert_eq!(refused(answer), (403, "forbidden"), "{answer:?}");
+            }
+            // But every member sees who is in it.
+            assert_eq!(
+                get(&server, lesser, &format!("{this}/members")).await.0,
+                200
+            );
+        }
+
+        // An admin manages — up to the owners, and the team's existence.
+        let renamed = patch(&server, &admin, &this, json!({ "name": "  Operations " })).await;
+        assert_eq!(renamed.1["name"], "Operations");
+        assert_eq!(
+            patch(&server, &admin, &at(&reader), json!({ "role": "editor" }))
+                .await
+                .0,
+            204
+        );
+        for answer in [
+            patch(&server, &admin, &at(&editor), json!({ "role": "owner" })).await,
+            patch(&server, &admin, &at(&owner), json!({ "role": "admin" })).await,
+            delete(&server, &admin, &at(&owner)).await,
+            delete(&server, &admin, &this).await,
+        ] {
+            assert_eq!(refused(&answer), (403, "forbidden"), "{answer:?}");
+        }
+        // Nobody is invited as an owner, and a role is one of the four.
+        let invites = format!("{this}/invites");
+        assert_eq!(
+            post(&server, &owner, &invites, json!({ "role": "owner" }))
+                .await
+                .0,
+            400
+        );
+        assert!(
+            post(&server, &owner, &invites, json!({ "role": "king" }))
+                .await
+                .0
+                >= 400
+        );
+
+        // A team keeps an owner: the only one neither steps down nor leaves.
+        assert_eq!(
+            refused(&patch(&server, &owner, &at(&owner), json!({ "role": "admin" })).await),
+            (409, "last-owner")
+        );
+        assert_eq!(
+            refused(&delete(&server, &owner, &at(&owner)).await),
+            (409, "last-owner")
+        );
+        // And an owner is made from a member who has the key.
+        assert_eq!(
+            refused(&patch(&server, &owner, &at(&waiting), json!({ "role": "owner" })).await),
+            (409, "not-active")
+        );
+        assert_eq!(
+            patch(&server, &owner, &at(&admin), json!({ "role": "owner" }))
+                .await
+                .0,
+            204
+        );
+        assert_eq!(
+            patch(&server, &owner, &at(&owner), json!({ "role": "admin" }))
+                .await
+                .0,
+            204
+        );
+        assert_eq!(mine(&server, &owner).await[0]["role"], "admin");
+        assert_eq!(
+            refused(&delete(&server, &admin, &at(&admin)).await),
+            (409, "last-owner"),
+            "the new owner is the only one now"
+        );
+
+        // Only an owner deletes the team, and its records go with it.
+        assert_eq!(
+            refused(&delete(&server, &owner, &this).await),
+            (403, "forbidden")
+        );
+        assert_eq!(delete(&server, &admin, &this).await.0, 204);
+        for device in [&owner, &admin, &editor, &reader, &waiting] {
+            assert!(mine(&server, device).await.is_empty());
+            assert_eq!(
+                refused(&pull(&server, device, team, 0).await),
+                (404, "not-found")
+            );
+        }
+        let left: i64 = server
+            .state
+            .db
+            .lock()
+            .query_row(
+                "SELECT (SELECT count(*) FROM team_records) + (SELECT count(*) FROM team_members)
+                      + (SELECT count(*) FROM team_invites) + (SELECT count(*) FROM teams)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn a_removed_member_is_out_at_once_and_a_rotation_moves_the_team_on() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let editor = member(&server, 2).await;
+        let reader = member(&server, 3).await;
+        let waiting = member(&server, 4).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &editor, 2, "editor").await;
+        admit(&server, &owner, team, &reader, 3, "reader").await;
+        let code = invite(&server, &owner, team, "editor").await;
+        assert_eq!(join(&server, &waiting, &code).await.0, 200);
+        let two = [
+            record(team, Uuid::now_v7(), 0, b"one"),
+            record(team, Uuid::now_v7(), 0, b"two"),
+        ];
+        assert_eq!(push(&server, &editor, team, 1, &two).await.0, 200);
+
+        // Taken out: from this request on there is no team for them.
+        let gone = delete(
+            &server,
+            &owner,
+            &format!("/v1/teams/{team}/members/{}", editor.account),
+        )
+        .await;
+        assert_eq!(gone.0, 204, "{gone:?}");
+        assert_eq!(
+            refused(&pull(&server, &editor, team, 0).await),
+            (404, "not-found")
+        );
+        assert_eq!(
+            refused(
+                &push(
+                    &server,
+                    &editor,
+                    team,
+                    1,
+                    &[record(team, Uuid::now_v7(), 0, b"x")]
+                )
+                .await
+            ),
+            (404, "not-found")
+        );
+        assert!(mine(&server, &editor).await.is_empty());
+        // They knew the key, so the team wants a new one — and says so.
+        assert_eq!(mine(&server, &owner).await[0]["needs_rotation"], true);
+        assert_eq!(
+            pull(&server, &reader, team, 0).await.1["needs_rotation"],
+            true
+        );
+
+        let rotate = format!("/v1/teams/{team}/rotate");
+        let for_ = |device: &Device| json!({ "account_id": device.account, "wrapped_key": wrapped("new") });
+        let both = json!([for_(&owner), for_(&reader)]);
+
+        // Not a reader's to do.
+        assert_eq!(
+            refused(
+                &post(
+                    &server,
+                    &reader,
+                    &rotate,
+                    json!({ "epoch": 2, "keys": both })
+                )
+                .await
+            ),
+            (403, "forbidden")
+        );
+        // The next epoch, and no other.
+        for epoch in [1, 3] {
+            let answer = post(
+                &server,
+                &owner,
+                &rotate,
+                json!({ "epoch": epoch, "keys": both }),
+            )
+            .await;
+            assert_eq!(refused(&answer), (409, "stale-epoch"), "{epoch}");
+            assert_eq!(answer.1["epoch"], 1);
+        }
+        // Exactly the members who have the key: nobody left out, nobody
+        // slipped in — not the one who was removed, not the one who waits —
+        // and nobody twice.
+        for keys in [
+            json!([for_(&owner)]),
+            json!([for_(&owner), for_(&reader), for_(&editor)]),
+            json!([for_(&owner), for_(&reader), for_(&waiting)]),
+            json!([for_(&owner), for_(&reader), for_(&reader)]),
+            json!([]),
+        ] {
+            let answer = post(
+                &server,
+                &owner,
+                &rotate,
+                json!({ "epoch": 2, "keys": keys }),
+            )
+            .await;
+            assert_eq!(refused(&answer), (409, "members-mismatch"), "{keys}");
+        }
+        // With a cursor: only if nothing was pushed since.
+        assert_eq!(
+            refused(
+                &post(
+                    &server,
+                    &owner,
+                    &rotate,
+                    json!({ "epoch": 2, "keys": both, "cursor": 1 })
+                )
+                .await
+            ),
+            (409, "stale-cursor")
+        );
+        // None of that changed anything.
+        assert_eq!(
+            pull(&server, &reader, team, 0).await.1["envelopes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let rotated = post(
+            &server,
+            &owner,
+            &rotate,
+            json!({ "epoch": 2, "keys": both, "cursor": 2 }),
+        )
+        .await;
+        assert_eq!(rotated.0, 200, "{rotated:?}");
+        assert_eq!(rotated.1["epoch"], 2);
+        assert_eq!(rotated.1["needs_rotation"], false);
+        assert_eq!(rotated.1["wrapped_key"], wrapped("new"));
+
+        // The old epoch's records are gone, its key is no use for writing,
+        // and the numbers go on from where they were.
+        let page = pull(&server, &reader, team, 0).await.1;
+        assert!(page["envelopes"].as_array().unwrap().is_empty());
+        assert_eq!(page["epoch"], 2);
+        assert_eq!(
+            mine(&server, &reader).await[0]["wrapped_key"],
+            wrapped("new")
+        );
+        let late = push(
+            &server,
+            &owner,
+            team,
+            1,
+            &[record(team, Uuid::now_v7(), 0, b"old key")],
+        )
+        .await;
+        assert_eq!(refused(&late), (409, "stale-epoch"));
+        assert_eq!(late.1["epoch"], 2);
+        let again = push(
+            &server,
+            &owner,
+            team,
+            2,
+            &[record(team, two[0].id, 0, b"new key")],
+        )
+        .await;
+        assert_eq!(again.1["accepted"][0]["seq"], 3);
+        let after = pull(&server, &reader, team, 2).await.1;
+        assert_eq!(after["envelopes"].as_array().unwrap().len(), 1);
+        assert_eq!(after["cursor"], 3);
+
+        // Who waited still waits, and is let in with the new epoch's key.
+        assert_eq!(mine(&server, &waiting).await[0]["state"], "pending");
+        assert_eq!(
+            refused(&confirm(&server, &owner, team, &waiting, 4, 1).await),
+            (409, "stale-epoch")
+        );
+        assert_eq!(confirm(&server, &owner, team, &waiting, 4, 2).await.0, 204);
+
+        // Leaving is removing oneself, and calls for a rotation the same.
+        let left = delete(
+            &server,
+            &reader,
+            &format!("/v1/teams/{team}/members/{}", reader.account),
+        )
+        .await;
+        assert_eq!(left.0, 204);
+        assert_eq!(
+            refused(&pull(&server, &reader, team, 0).await),
+            (404, "not-found")
+        );
+        assert_eq!(mine(&server, &owner).await[0]["needs_rotation"], true);
+        assert_eq!(mine(&server, &owner).await[0]["members"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_invite_is_good_for_a_week_and_for_one_member() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let first = member(&server, 2).await;
+        let second = member(&server, 3).await;
+        let team = team(&server, &owner).await;
+        let other_team = {
+            let answer = post(
+                &server,
+                &first,
+                "/v1/teams",
+                json!({ "name": "Other", "display_name": "First", "wrapped_key": wrapped("k") }),
+            )
+            .await;
+            answer.1["id"].as_str().unwrap().to_string()
+        };
+        let invites = format!("/v1/teams/{team}/invites");
+
+        // What is listed is that there is one, never its code.
+        let made = post(&server, &owner, &invites, json!({ "role": "reader" }))
+            .await
+            .1;
+        let code = made["code"].as_str().unwrap().to_string();
+        let now = server.state.clock.now_ms();
+        let expires = made["expires_ms"].as_u64().unwrap();
+        assert!(expires > now + WEEK_MS - 60_000 && expires <= now + WEEK_MS);
+        let listed = get(&server, &owner, &invites).await.1;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"], made["id"]);
+        assert_eq!(listed[0]["role"], "reader");
+        assert_eq!(listed[0]["created_by"], owner.account.to_string());
+        assert!(listed[0].get("code").is_none());
+        let stored: Vec<u8> = server
+            .state
+            .db
+            .lock()
+            .query_row("SELECT code_hash FROM team_invites", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored.len(), 32, "a hash, not the code");
+
+        // Somebody already in gains nothing by it, and does not use it up.
+        assert_eq!(
+            refused(&join(&server, &owner, &code).await),
+            (409, "already-member")
+        );
+        // It is typed as it is read: case and dashes do not matter.
+        let typed = code.replace('-', " ").to_lowercase();
+        assert_eq!(join(&server, &first, &typed).await.0, 200);
+        // Once.
+        assert_eq!(
+            refused(&join(&server, &second, &code).await),
+            (403, "invalid-invite")
+        );
+        assert!(get(&server, &owner, &invites)
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // An invite of this team is not another team's to take back.
+        let kept = post(&server, &owner, &invites, json!({ "role": "reader" }))
+            .await
+            .1;
+        let theirs = format!(
+            "/v1/teams/{other_team}/invites/{}",
+            kept["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            refused(&delete(&server, &first, &theirs).await),
+            (404, "not-found")
+        );
+        // Taken back, it lets nobody in.
+        let own = format!("{invites}/{}", kept["id"].as_str().unwrap());
+        assert_eq!(delete(&server, &owner, &own).await.0, 204);
+        assert_eq!(
+            refused(&delete(&server, &owner, &own).await),
+            (404, "not-found")
+        );
+        assert_eq!(
+            refused(&join(&server, &second, kept["code"].as_str().unwrap()).await),
+            (403, "invalid-invite")
+        );
+
+        // A week later it has run out — and looks like any wrong code.
+        let late = invite(&server, &owner, team, "editor").await;
+        server.state.clock.advance(WEEK_MS - 60_000);
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        server.state.clock.advance(60_001);
+        assert!(get(&server, &owner, &invites)
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            refused(&join(&server, &second, &late).await),
+            (403, "invalid-invite")
+        );
+        assert_eq!(
+            refused(&join(&server, &second, "AAAAA-BBBBB-CCCCC").await),
+            (403, "invalid-invite")
+        );
+        assert!(mine(&server, &second).await.is_empty());
+
+        // One that works still does, after those tries.
+        let good = invite(&server, &owner, team, "editor").await;
+        assert_eq!(join(&server, &second, &good).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn guessing_codes_is_slowed_down_and_invites_do_not_pile_up() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let guesser = member(&server, 2).await;
+        let team = team(&server, &owner).await;
+
+        let mut statuses = Vec::new();
+        for _ in 0..11 {
+            statuses.push(join(&server, &guesser, "AAAAA-BBBBB-CCCCC").await.0);
+        }
+        assert_eq!(statuses[..10], [403; 10]);
+        assert_eq!(statuses[10], 429);
+        // Also for a code that would have worked.
+        let code = invite(&server, &owner, team, "reader").await;
+        assert_eq!(
+            refused(&join(&server, &guesser, &code).await),
+            (429, "rate-limited")
+        );
+
+        let invites = format!("/v1/teams/{team}/invites");
+        for _ in 1..20 {
+            invite(&server, &owner, team, "reader").await;
+        }
+        assert_eq!(
+            refused(&post(&server, &owner, &invites, json!({ "role": "reader" })).await),
+            (403, "too-many-invites")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_decides_whether_who_and_how_many() {
+        // Off: the policy says so, and nothing else answers.
+        let off = with_teams(Teams {
+            enabled: false,
+            ..Teams::default()
+        })
+        .await;
+        let device = Device::create_account(&off, "", "master", 1).await;
+        let policy = get(&off, &device, "/v1/teams/policy").await;
+        assert_eq!(policy.0, 200);
+        assert_eq!(policy.1["enabled"], false);
+        assert_eq!(policy.1["may_create"], false);
+        let team = Uuid::now_v7();
+        let identity = json!({ "public_key": key(1), "sealed_private": wrapped("s") });
+        for answer in [
+            get(&off, &device, "/v1/teams").await,
+            get(&off, &device, "/v1/teams/identity").await,
+            call(
+                &off,
+                &device,
+                reqwest::Method::PUT,
+                "/v1/teams/identity",
+                Some(identity),
+            )
+            .await,
+            post(&off, &device, "/v1/teams", json!({})).await,
+            post(&off, &device, "/v1/teams/join", json!({})).await,
+            get(&off, &device, &format!("/v1/teams/{team}/members")).await,
+            get(&off, &device, &format!("/v1/teams/{team}/invites")).await,
+            post(
+                &off,
+                &device,
+                &format!("/v1/teams/{team}/rotate"),
+                json!({}),
+            )
+            .await,
+            pull(&off, &device, team, 0).await,
+            push(&off, &device, team, 1, &[]).await,
+            delete(&off, &device, &format!("/v1/teams/{team}")).await,
+        ] {
+            assert_eq!(refused(&answer), (403, "teams-disabled"), "{answer:?}");
+        }
+
+        // Nobody may create one: the rest still works.
+        let closed = with_teams(Teams {
+            creation: TeamCreation::None,
+            ..Teams::default()
+        })
+        .await;
+        let device = member(&closed, 1).await;
+        let policy = get(&closed, &device, "/v1/teams/policy").await.1;
+        assert_eq!(
+            (&policy["enabled"], &policy["may_create"]),
+            (&json!(true), &json!(false))
+        );
+        let answer = post(
+            &closed,
+            &device,
+            "/v1/teams",
+            json!({ "name": "Ops", "display_name": "Olive", "wrapped_key": wrapped("k") }),
+        )
+        .await;
+        assert_eq!(refused(&answer), (403, "team-creation-closed"));
+        assert!(mine(&closed, &device).await.is_empty());
+
+        // One team per account, two members per team.
+        let small = with_teams(Teams {
+            max_per_account: 1,
+            max_members: 2,
+            ..Teams::default()
+        })
+        .await;
+        let owner = member(&small, 1).await;
+        let second = member(&small, 2).await;
+        let third = member(&small, 3).await;
+        let busy = member(&small, 4).await;
+        let policy = get(&small, &owner, "/v1/teams/policy").await.1;
+        assert_eq!(policy["max_teams_per_account"], 1);
+        assert_eq!(policy["max_members_per_team"], 2);
+        let team = self::team(&small, &owner).await;
+        let another = post(
+            &small,
+            &owner,
+            "/v1/teams",
+            json!({ "name": "More", "display_name": "Olive", "wrapped_key": wrapped("k") }),
+        )
+        .await;
+        assert_eq!(refused(&another), (403, "team-limit"));
+        // Joining counts as well as creating, also while waiting.
+        self::team(&small, &busy).await;
+        let code = invite(&small, &owner, team, "reader").await;
+        assert_eq!(
+            refused(&join(&small, &busy, &code).await),
+            (403, "team-limit")
+        );
+        // The code that could not be used is still good.
+        assert_eq!(join(&small, &second, &code).await.0, 200);
+        let code = invite(&small, &owner, team, "reader").await;
+        assert_eq!(
+            refused(&join(&small, &third, &code).await),
+            (403, "team-full")
+        );
+        let out = format!("/v1/teams/{team}/members/{}", second.account);
+        assert_eq!(delete(&small, &owner, &out).await.0, 204);
+        // Nobody who had the key went: no rotation is called for.
+        assert_eq!(mine(&small, &owner).await[0]["needs_rotation"], false);
+        assert_eq!(join(&small, &third, &code).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn a_member_key_is_set_once_and_replacing_it_means_waiting_again() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let other = Device::create_account(&server, "", "master", 2).await;
+        let put = |device: &'static str, body: Value| {
+            let server = &server;
+            let (owner, other) = (&owner, &other);
+            async move {
+                let device = if device == "owner" { owner } else { other };
+                call(
+                    server,
+                    device,
+                    reqwest::Method::PUT,
+                    "/v1/teams/identity",
+                    Some(body),
+                )
+                .await
+            }
+        };
+
+        // Without one there is no creating and no joining.
+        assert_eq!(
+            refused(&get(&server, &other, "/v1/teams/identity").await),
+            (404, "not-found")
+        );
+        let team = team(&server, &owner).await;
+        let code = invite(&server, &owner, team, "admin").await;
+        assert_eq!(
+            refused(&join(&server, &other, &code).await),
+            (409, "no-identity")
+        );
+        let answer = post(
+            &server,
+            &other,
+            "/v1/teams",
+            json!({ "name": "Ops", "display_name": "Otto", "wrapped_key": wrapped("k") }),
+        )
+        .await;
+        assert_eq!(refused(&answer), (409, "no-identity"));
+
+        // A key is 32 bytes, and what is sealed is bounded.
+        for body in [
+            json!({ "public_key": wrapped("short"), "sealed_private": wrapped("s") }),
+            json!({ "public_key": key(2), "sealed_private": "" }),
+            json!({ "public_key": key(2), "sealed_private": "not base64!" }),
+            json!({ "public_key": key(2), "sealed_private": uwusync_server::b64::encode(vec![1u8; 1025]) }),
+        ] {
+            assert_eq!(put("other", body.clone()).await.0, 400, "{body}");
+        }
+        let stored = put(
+            "other",
+            json!({ "public_key": key(2), "sealed_private": wrapped("sealed") }),
+        )
+        .await;
+        assert_eq!(stored.0, 200, "{stored:?}");
+        let read = get(&server, &other, "/v1/teams/identity").await.1;
+        assert_eq!(read["public_key"], key(2));
+        assert_eq!(read["sealed_private"], wrapped("sealed"));
+        // Nobody reads another account's: there is no route that would.
+
+        // The first one stays unless the client says it means it.
+        let second = json!({ "public_key": key(9), "sealed_private": wrapped("other") });
+        assert_eq!(
+            refused(&put("other", second).await),
+            (409, "identity-exists")
+        );
+        assert_eq!(
+            get(&server, &other, "/v1/teams/identity").await.1["public_key"],
+            key(2)
+        );
+
+        assert_eq!(join(&server, &other, &code).await.0, 200);
+        assert_eq!(confirm(&server, &owner, team, &other, 2, 1).await.0, 204);
+        assert_eq!(pull(&server, &other, team, 0).await.0, 200);
+
+        // Sealing the same key anew is the device's to do with its token.
+        let resealed = put(
+            "other",
+            json!({ "public_key": key(2), "sealed_private": wrapped("resealed"), "replace": true }),
+        )
+        .await;
+        assert_eq!(resealed.0, 200, "{resealed:?}");
+        assert_eq!(mine(&server, &other).await[0]["state"], "active");
+
+        // Another key is the account holder's to put there, not a device's:
+        // not without the master password, and not with a wrong one.
+        for proof in [None, Some("a guess")] {
+            let mut body = json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true });
+            if let Some(password) = proof {
+                body["current_auth_key"] = json!(login_key(password));
+            }
+            assert_eq!(
+                refused(&put("other", body).await),
+                (403, "wrong-password"),
+                "{proof:?}"
+            );
+        }
+        let malformed = put(
+            "other",
+            json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true,
+                    "current_auth_key": "short" }),
+        )
+        .await;
+        assert_eq!(refused(&malformed), (400, "invalid"));
+        assert_eq!(
+            get(&server, &other, "/v1/teams/identity").await.1["public_key"],
+            key(2)
+        );
+        assert_eq!(mine(&server, &other).await[0]["state"], "active");
+        assert_eq!(pull(&server, &other, team, 0).await.0, 200);
+
+        // Replaced: what was wrapped to the old key is dropped, and the
+        // member waits until somebody has checked the new one.
+        let replaced = put(
+            "other",
+            json!({ "public_key": key(9), "sealed_private": wrapped("other"), "replace": true,
+                    "current_auth_key": login_key("master") }),
+        )
+        .await;
+        assert_eq!(replaced.0, 200, "{replaced:?}");
+        let waiting = mine(&server, &other).await;
+        assert_eq!(waiting[0]["state"], "pending");
+        assert_eq!(waiting[0]["wrapped_key"], Value::Null);
+        assert_eq!(waiting[0]["role"], "admin");
+        assert_eq!(
+            refused(&pull(&server, &other, team, 0).await),
+            (403, "membership-pending")
+        );
+        assert_eq!(
+            refused(
+                &post(
+                    &server,
+                    &other,
+                    &format!("/v1/teams/{team}/invites"),
+                    json!({ "role": "reader" })
+                )
+                .await
+            ),
+            (403, "membership-pending")
+        );
+        let members = get(&server, &owner, &format!("/v1/teams/{team}/members"))
+            .await
+            .1;
+        assert_eq!(members[1]["state"], "pending");
+        assert_eq!(members[1]["public_key"], key(9));
+        // A key wrapped to the old one is refused; to the new one, taken.
+        assert_eq!(
+            refused(&confirm(&server, &owner, team, &other, 2, 1).await),
+            (409, "identity-changed")
+        );
+        assert_eq!(confirm(&server, &owner, team, &other, 9, 1).await.0, 204);
+        assert_eq!(pull(&server, &other, team, 0).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn a_team_holds_what_the_server_allows_and_what_is_sent_is_bounded() {
+        let server = start_with(Config {
+            registration: Registration::Open,
+            quota: uwusync_server::db::records::Quota {
+                records: 2,
+                bytes: 1024 * 1024,
+                ..Default::default()
+            },
+            ..Config::default()
+        })
+        .await;
+        let owner = member(&server, 1).await;
+        let team = team(&server, &owner).await;
+        let other = {
+            let answer = post(
+                &server,
+                &owner,
+                "/v1/teams",
+                json!({ "name": "Other", "display_name": "Olive", "wrapped_key": wrapped("k") }),
+            )
+            .await;
+            answer.1["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+        };
+
+        // Each team counts for itself, and beside the account's own vault.
+        let two = |team: Uuid| {
+            [
+                record(team, Uuid::now_v7(), 0, b"one"),
+                record(team, Uuid::now_v7(), 0, b"two"),
+            ]
+        };
+        assert_eq!(push(&server, &owner, team, 1, &two(team)).await.0, 200);
+        assert_eq!(push(&server, &owner, other, 1, &two(other)).await.0, 200);
+        owner
+            .push(
+                &server,
+                &[
+                    owner.envelope(Uuid::now_v7(), 0, b"own"),
+                    owner.envelope(Uuid::now_v7(), 0, b"own"),
+                ],
+            )
+            .await;
+        let more = push(
+            &server,
+            &owner,
+            team,
+            1,
+            &[record(team, Uuid::now_v7(), 0, b"three")],
+        )
+        .await;
+        assert_eq!(refused(&more), (413, "too-large"));
+        assert_eq!(
+            pull(&server, &owner, team, 0).await.1["envelopes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // A record of one team does not get into another by its address.
+        let misfiled = push(
+            &server,
+            &owner,
+            other,
+            1,
+            &[record(team, Uuid::now_v7(), 0, b"x")],
+        )
+        .await;
+        assert_eq!(misfiled.0, 400);
+        // Pages are the mailbox's pages.
+        let page = get(
+            &server,
+            &owner,
+            &format!("/v1/teams/{team}/records?cursor=0&limit=1"),
+        )
+        .await
+        .1;
+        assert_eq!(page["envelopes"].as_array().unwrap().len(), 1);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["cursor"], 1);
+        let rest = get(
+            &server,
+            &owner,
+            &format!("/v1/teams/{team}/records?since=1"),
+        )
+        .await
+        .1;
+        assert_eq!(rest["envelopes"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["has_more"], false);
+
+        // Names and keys: not empty, not long, nothing unprintable.
+        let long = "x".repeat(81);
+        for body in [
+            json!({ "name": "", "display_name": "Olive", "wrapped_key": wrapped("k") }),
+            json!({ "name": "   ", "display_name": "Olive", "wrapped_key": wrapped("k") }),
+            json!({ "name": long, "display_name": "Olive", "wrapped_key": wrapped("k") }),
+            json!({ "name": "Ops\u{7}", "display_name": "Olive", "wrapped_key": wrapped("k") }),
+            json!({ "name": "Ops", "display_name": "x".repeat(61), "wrapped_key": wrapped("k") }),
+            json!({ "name": "Ops", "display_name": "Olive", "wrapped_key": "" }),
+            json!({ "name": "Ops", "display_name": "Olive",
+                    "wrapped_key": uwusync_server::b64::encode(vec![1u8; 513]) }),
+        ] {
+            assert_eq!(
+                refused(&post(&server, &owner, "/v1/teams", body.clone()).await),
+                (400, "invalid"),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            refused(
+                &patch(
+                    &server,
+                    &owner,
+                    &format!("/v1/teams/{team}"),
+                    json!({ "name": "x".repeat(81) })
+                )
+                .await
+            ),
+            (400, "invalid")
+        );
+        // What is not what the endpoint takes is refused, not crashed on.
+        for body in [json!([]), json!({ "name": 7 }), json!(null)] {
+            let answer = post(&server, &owner, "/v1/teams", body).await;
+            assert!((400..500).contains(&answer.0), "{answer:?}");
+        }
+        let answer = post(
+            &server,
+            &owner,
+            &format!("/v1/teams/{team}/rotate"),
+            json!({ "epoch": 2, "keys": [{ "account_id": "nobody", "wrapped_key": "k" }] }),
+        )
+        .await;
+        assert!((400..500).contains(&answer.0), "{answer:?}");
+        assert_eq!(mine(&server, &owner).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_invite_lasts_as_long_as_its_maker_may_invite() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let admin = member(&server, 2).await;
+        let newcomer = member(&server, 3).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &admin, 2, "admin").await;
+        let at = format!("/v1/teams/{team}/members/{}", admin.account);
+        let invites = format!("/v1/teams/{team}/invites");
+        let kept = invite(&server, &owner, team, "reader").await;
+
+        // Made by an admin who is then an editor: it lets nobody in.
+        let made = invite(&server, &admin, team, "admin").await;
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            patch(&server, &owner, &at, json!({ "role": "editor" }))
+                .await
+                .0,
+            204
+        );
+        assert_eq!(
+            refused(&join(&server, &newcomer, &made).await),
+            (403, "invalid-invite")
+        );
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Made by an admin who is then taken out: the same.
+        assert_eq!(
+            patch(&server, &owner, &at, json!({ "role": "admin" }))
+                .await
+                .0,
+            204
+        );
+        let made = invite(&server, &admin, team, "admin").await;
+        assert_eq!(delete(&server, &owner, &at).await.0, 204);
+        assert_eq!(
+            refused(&join(&server, &newcomer, &made).await),
+            (403, "invalid-invite")
+        );
+
+        // Anybody else's are as good as they were.
+        assert_eq!(
+            get(&server, &owner, &invites)
+                .await
+                .1
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(join(&server, &newcomer, &kept).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_record_is_forgotten_once_every_reading_device_has_seen_it() {
+        use uwusync_server::db::teams as stored;
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let reader = member(&server, 2).await;
+        let never = member(&server, 3).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &reader, 2, "reader").await;
+        // A member whose device never reads the team holds nothing back.
+        admit(&server, &owner, team, &never, 3, "reader").await;
+
+        let id = Uuid::now_v7();
+        assert_eq!(
+            push(&server, &owner, team, 1, &[record(team, id, 0, b"sealed")])
+                .await
+                .0,
+            200
+        );
+        assert_eq!(pull(&server, &reader, team, 0).await.1["cursor"], 1);
+        let mut gone = record(team, id, 1, b"gone");
+        gone.deleted = true;
+        let pushed = push(&server, &owner, team, 1, &[gone]).await;
+        assert_eq!(pushed.1["accepted"][0]["seq"], 2, "{pushed:?}");
+        assert_eq!(pull(&server, &owner, team, 0).await.1["cursor"], 2);
+
+        let later = server.state.clock.now_ms() + WEEK_MS;
+        let purge =
+            |before: u64| stored::purge_tombstones(&server.state.db.lock(), team, before).unwrap();
+        // The reader's device has the record and not yet the marker.
+        assert_eq!(
+            stored::lowest_cursor(&server.state.db.lock(), team).unwrap(),
+            1
+        );
+        assert_eq!(purge(later), 0);
+        assert_eq!(
+            pull(&server, &reader, team, 1).await.1["envelopes"][0]["deleted"],
+            true
+        );
+        // Seen by all, but not old yet.
+        assert_eq!(purge(0), 0);
+        assert_eq!(purge(later), 1);
+        assert!(pull(&server, &never, team, 0).await.1["envelopes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let held: (i64, i64) = server
+            .state
+            .db
+            .lock()
+            .query_row("SELECT record_count, record_bytes FROM teams", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(held, (0, 0));
+
+        // The operator's delete takes the whole team or nothing.
+        assert!(stored::delete_any(&server.state.db.lock(), team).unwrap());
+        assert!(!stored::delete_any(&server.state.db.lock(), team).unwrap());
+        let left: i64 = server
+            .state
+            .db
+            .lock()
+            .query_row(
+                "SELECT (SELECT count(*) FROM team_cursors) + (SELECT count(*) FROM team_members)
+                      + (SELECT count(*) FROM team_invites) + (SELECT count(*) FROM teams)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(
+            refused(&pull(&server, &owner, team, 0).await),
+            (404, "not-found")
+        );
+    }
+
+    /// Read the stream until `wanted` has come by.
+    async fn hears(stream: &mut reqwest::Response, wanted: &str) {
+        let mut heard = String::new();
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !heard.contains(wanted) {
+                let chunk = stream
+                    .chunk()
+                    .await
+                    .unwrap()
+                    .expect("the stream stays open");
+                heard.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await;
+        assert!(found.is_ok(), "expected {wanted:?}, heard {heard:?}");
+    }
+
+    #[tokio::test]
+    async fn a_member_hears_when_a_team_changes() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let reader = member(&server, 2).await;
+        let team = team(&server, &owner).await;
+        admit(&server, &owner, team, &reader, 2, "reader").await;
+
+        let mut stream = server
+            .client
+            .get(server.url("/v1/events"))
+            .bearer_auth(&reader.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), 200);
+        while server.state.events.listeners(reader.account) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let event = format!("event: team\ndata: {team}");
+
+        // Records.
+        push(
+            &server,
+            &owner,
+            team,
+            1,
+            &[record(team, Uuid::now_v7(), 0, b"new")],
+        )
+        .await;
+        hears(&mut stream, &event).await;
+        // The key.
+        let rotated = post(
+            &server,
+            &owner,
+            &format!("/v1/teams/{team}/rotate"),
+            json!({ "epoch": 2, "keys": [
+                { "account_id": owner.account, "wrapped_key": wrapped("n") },
+                { "account_id": reader.account, "wrapped_key": wrapped("n") },
+            ] }),
+        )
+        .await;
+        assert_eq!(rotated.0, 200, "{rotated:?}");
+        hears(&mut stream, &event).await;
+        // Being taken out: the last thing they hear about it.
+        let out = format!("/v1/teams/{team}/members/{}", reader.account);
+        assert_eq!(delete(&server, &owner, &out).await.0, 204);
+        hears(&mut stream, &event).await;
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_missed_events_is_told_to_look_at_every_team() {
+        let server = open().await;
+        let owner = member(&server, 1).await;
+        let team = team(&server, &owner).await;
+        let mut stream = server
+            .client
+            .get(server.url("/v1/events"))
+            .bearer_auth(&owner.token)
+            .send()
+            .await
+            .unwrap();
+        while server.state.events.listeners(owner.account) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // More at once than a stream holds, with no chance to read between.
+        for _ in 0..40 {
+            server.state.events.announce_team(&[owner.account], team);
+        }
+        hears(&mut stream, "event: team\ndata: *\n").await;
+        // And what it still held follows.
+        hears(&mut stream, &format!("event: team\ndata: {team}")).await;
+    }
+}

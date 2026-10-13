@@ -12,7 +12,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use uwusync_server::api;
 use uwusync_server::config::TlsMode;
-use uwusync_server::db::{accounts, devices, invites, records, with_suffix, Db};
+use uwusync_server::db::{accounts, devices, invites, records, teams, with_suffix, Db};
 use uwusync_server::{connections, health, now_ms, tls, updates, AppState, Config};
 
 #[derive(Parser)]
@@ -38,6 +38,13 @@ enum Command {
     Devices { account: Uuid },
     /// Shut a device out.
     Revoke { device: Uuid },
+    /// List the teams on this server: id, name, members, records, created.
+    Teams,
+    /// Delete a team with everything it holds. Its members keep their
+    /// accounts and their own vaults.
+    TeamDelete { team: Uuid },
+    /// Make a member of a team an owner — for a team that has none left.
+    TeamOwner { team: Uuid, account: Uuid },
     /// Print the fingerprint of this server certificate, which is what a
     /// device pins.
     Fingerprint,
@@ -192,6 +199,47 @@ fn main() -> Result<(), String> {
                     "It was already revoked."
                 }
             );
+            Ok(())
+        }
+        Command::Teams => {
+            let teams = teams::all(&db.lock()).map_err(|error| error.to_string())?;
+            if teams.is_empty() {
+                println!("No teams.");
+            }
+            for team in teams {
+                println!(
+                    "{}  {:?}  {} member(s)  {} record(s)  since {}{}",
+                    team.id,
+                    team.name,
+                    team.members,
+                    team.records,
+                    date(team.created_ms),
+                    if team.owners == 0 {
+                        "  (no owner: see team-owner)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        Command::TeamDelete { team } => {
+            let gone = teams::delete_any(&db.lock(), team).map_err(|error| error.to_string())?;
+            if !gone {
+                return Err(format!("no team {team}"));
+            }
+            println!("Deleted, with its records. Its members' devices drop it at their next sync.");
+            Ok(())
+        }
+        Command::TeamOwner { team, account } => {
+            let made =
+                teams::make_owner(&db.lock(), team, account).map_err(|error| error.to_string())?;
+            if !made {
+                return Err(format!(
+                    "account {account} is not a member of team {team} who has its key"
+                ));
+            }
+            println!("That member owns the team now.");
             Ok(())
         }
         Command::Fingerprint => {
@@ -405,6 +453,7 @@ fn maintenance(state: AppState) {
 fn purge(db: &Db) {
     const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1000;
     let _ = invites::purge(&db.lock());
+    let _ = teams::purge(&db.lock(), now_ms());
     let ids: Vec<String> = match db
         .lock()
         .prepare("SELECT id FROM accounts")
@@ -430,6 +479,22 @@ fn purge(db: &Db) {
             Ok(0) => {}
             Ok(gone) => tracing::info!(%id, gone, "tombstones forgotten"),
             Err(error) => tracing::warn!(%error, "could not purge tombstones"),
+        }
+    }
+    // Teams the same way, one at a time.
+    let teams = match teams::all(&db.lock()) {
+        Ok(teams) => teams,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the teams");
+            return;
+        }
+    };
+    for team in teams {
+        let before = now_ms().saturating_sub(NINETY_DAYS_MS);
+        match teams::purge_tombstones(&db.lock(), team.id, before) {
+            Ok(0) => {}
+            Ok(gone) => tracing::info!(team = %team.id, gone, "tombstones forgotten"),
+            Err(error) => tracing::warn!(%error, "could not purge a team's tombstones"),
         }
     }
 }
