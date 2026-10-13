@@ -12,7 +12,7 @@ rust-version = "1.89"
 # The wire format, the clock and the conflict rule, straight from the client:
 # one definition, so client and server cannot drift apart. Pinned to a commit —
 # `cargo update -p uwussh-proto` after bumping this is a deliberate act.
-uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ca611bf5576367109c604239aa55cdcb0b24e71b" }
+uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ff32f75bf11b2d18ac75407fda36bd49b76ca637" }
 
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -61,9 +61,9 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # The real client, so one test can drive both halves of the protocol against
 # each other instead of trusting that they agree.
-uwussh-store = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ca611bf5576367109c604239aa55cdcb0b24e71b" }
-uwussh-sync = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ca611bf5576367109c604239aa55cdcb0b24e71b" }
-uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ca611bf5576367109c604239aa55cdcb0b24e71b" }
+uwussh-store = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ff32f75bf11b2d18ac75407fda36bd49b76ca637" }
+uwussh-sync = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ff32f75bf11b2d18ac75407fda36bd49b76ca637" }
+uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "ff32f75bf11b2d18ac75407fda36bd49b76ca637" }
 zeroize = "1.9.0"
 # Time that runs on by itself, for what waits half a minute.
 tokio = { version = "1", features = ["test-util"] }

@@ -2846,8 +2846,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-proto"
-version = "0.3.0-beta.3"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ca611bf5576367109c604239aa55cdcb0b24e71b#ca611bf5576367109c604239aa55cdcb0b24e71b"
+version = "0.3.0-beta.4"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ff32f75bf11b2d18ac75407fda36bd49b76ca637#ff32f75bf11b2d18ac75407fda36bd49b76ca637"
 dependencies = [
  "serde",
  "serde_json",
@@ -2856,8 +2856,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-store"
-version = "0.3.0-beta.3"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ca611bf5576367109c604239aa55cdcb0b24e71b#ca611bf5576367109c604239aa55cdcb0b24e71b"
+version = "0.3.0-beta.4"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ff32f75bf11b2d18ac75407fda36bd49b76ca637#ff32f75bf11b2d18ac75407fda36bd49b76ca637"
 dependencies = [
  "base64 0.22.1",
  "parking_lot",
@@ -2876,8 +2876,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-sync"
-version = "0.3.0-beta.3"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ca611bf5576367109c604239aa55cdcb0b24e71b#ca611bf5576367109c604239aa55cdcb0b24e71b"
+version = "0.3.0-beta.4"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ff32f75bf11b2d18ac75407fda36bd49b76ca637#ff32f75bf11b2d18ac75407fda36bd49b76ca637"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 3.0.0",
@@ -2906,8 +2906,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-vault"
-version = "0.3.0-beta.3"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ca611bf5576367109c604239aa55cdcb0b24e71b#ca611bf5576367109c604239aa55cdcb0b24e71b"
+version = "0.3.0-beta.4"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=ff32f75bf11b2d18ac75407fda36bd49b76ca637#ff32f75bf11b2d18ac75407fda36bd49b76ca637"
 dependencies = [
  "argon2",
  "chacha20poly1305",

@@ -736,7 +736,7 @@ fn what_one_member_saves_in_a_team_the_other_reads_and_the_server_does_not() {
     };
     assert!(
         blobs.len() >= 4,
-        "two hosts, a password, the confirmed keys"
+        "two hosts, a password and whatever else the team keeps"
     );
     for blob in &blobs {
         let text = String::from_utf8_lossy(blob).to_string();
@@ -777,6 +777,25 @@ fn what_one_member_saves_in_a_team_the_other_reads_and_the_server_does_not() {
     assert!(keymap.bindings.contains_key("terminal:clear"));
     assert_eq!(laptop.hosts(team), ["bastion", "db"]);
     assert_eq!(laptop.password(team, bastion), b"hunter2");
+    // What the account wrote down about the team — which key it has, whose
+    // key was compared — came with the account's own records.
+    let (desk, lap) = (olive.spaces.main(), laptop.spaces.main());
+    let noted = desk
+        .team_key_record(team)
+        .unwrap()
+        .expect("the team's key, noted");
+    assert_eq!(noted.epoch, 2);
+    assert_eq!(lap.team_key_record(team).unwrap(), Some(noted));
+    let pin = desk
+        .team_pin(team, ben.account)
+        .unwrap()
+        .expect("Ben's key, compared");
+    assert_eq!(lap.team_pin(team, ben.account).unwrap(), Some(pin));
+    let listed = laptop.teams(|teams| teams.members(team)).unwrap();
+    assert!(
+        listed.iter().all(|member| member.confirmed == Some(true)),
+        "{listed:?}"
+    );
 
     // Nothing crossed over, in either direction, on either account.
     ben.pass();
@@ -902,9 +921,11 @@ fn a_removed_member_reads_nothing_more_and_who_stays_reads_everything() {
     let (old_epoch, _) = team_epoch(&running, team);
 
     // ── Out, and a new key in the same breath ──────────────────────────────
-    let known = olive
+    let removal = olive
         .teams(|teams| teams.remove(team, ben.account))
         .unwrap();
+    assert!(removal.rotated, "the owner confirmed everybody who stays");
+    let known = removal.hosts;
     assert_eq!(known.len(), 1, "the login Ben may still know: {known:?}");
     assert_eq!((known[0].id, known[0].name.as_str()), (bastion, "bastion"));
     assert_eq!(team_epoch(&running, team), (old_epoch + 1, false));
@@ -972,4 +993,112 @@ fn a_removed_member_reads_nothing_more_and_who_stays_reads_everything() {
         )
         .unwrap();
     assert_eq!(own, 3);
+}
+
+#[test]
+fn an_admin_gives_the_team_a_new_key_only_after_comparing_who_stays() {
+    let running = start_with(Registration::Invite);
+    let (olive, ada, cleo, dan) = (
+        Member::new(&running, "LVDesk1"),
+        Member::new(&running, "Adas"),
+        Member::new(&running, "Cleos"),
+        Member::new(&running, "Dans"),
+    );
+    let team = olive
+        .teams(|teams| teams.create("Ops", "Olive"))
+        .unwrap()
+        .id;
+    admit(&olive, team, &ada, TeamRole::Admin);
+    admit(&olive, team, &cleo, TeamRole::Editor);
+    admit(&olive, team, &dan, TeamRole::Editor);
+    let bastion = olive.add(team, "bastion", Some("hunter2")).unwrap();
+    for member in [&olive, &ada, &cleo, &dan] {
+        member.pass();
+    }
+    assert_eq!(dan.hosts(team), ["bastion"]);
+    let (old_epoch, _) = team_epoch(&running, team);
+    // Read off the two devices now: Olive's own next pass would give the
+    // team its key itself, she compared everybody.
+    let (seen_olive, seen_cleo) = (olive.fingerprint(), cleo.fingerprint());
+
+    // Ada was let in by Olive and has compared nobody's key herself. She
+    // may take Dan out — the server says so — but hands no key to people
+    // she only knows from the server's list.
+    let removal = ada.teams(|teams| teams.remove(team, dan.account)).unwrap();
+    assert!(!removal.rotated);
+    assert_eq!(removal.hosts.len(), 1);
+    assert_eq!(team_epoch(&running, team), (old_epoch, true));
+    assert_eq!(team_error(dan.server.pull(team, 0, 10)), "not-found");
+
+    let waiting = ada.pass();
+    let info = &waiting.status.teams[0];
+    assert!(info.needs_rotation);
+    let attention = info.attention.as_ref().expect("why there is no new key");
+    assert_eq!(
+        attention.kind,
+        uwussh_sync::AttentionKind::MemberUnconfirmed
+    );
+    assert_eq!(team_epoch(&running, team), (old_epoch, true));
+    // Meanwhile the team works as it did.
+    assert_eq!(ada.hosts(team), ["bastion"]);
+    // That a key is owed, her device keeps with the team's space.
+    let state = ada.space(team).unwrap().store.team_state().unwrap();
+    assert!(state.unwrap().rotation_owed);
+
+    // She compares, one after the other; the server hears nothing of it.
+    let listed = ada.teams(|teams| teams.members(team)).unwrap();
+    assert_eq!(listed.len(), 3);
+    for member in &listed {
+        assert_eq!(member.confirmed, Some(member.me), "{member:?}");
+    }
+    for (other, seen) in [(&olive, &seen_olive), (&cleo, &seen_cleo)] {
+        ada.teams(|teams| teams.confirm(team, other.account, seen))
+            .unwrap();
+        assert_eq!(team_epoch(&running, team), (old_epoch, true));
+    }
+
+    // Her next pass gives the team its key.
+    let pass = ada.pass();
+    assert!(
+        pass.status.teams[0].attention.is_none(),
+        "{:?}",
+        pass.status
+    );
+    assert!(!pass.status.teams[0].needs_rotation);
+    assert_eq!(team_epoch(&running, team), (old_epoch + 1, false));
+    let after = ada.add(team, "after", Some("tr0ub4dor")).unwrap();
+    ada.pass();
+
+    let state = ada.space(team).unwrap().store.team_state().unwrap();
+    assert!(!state.unwrap().rotation_owed);
+    // Which key the team has now, and whom she compared, went up with her
+    // own records: a second device of hers knows both.
+    let tablet = ada.second(&running, "AdasTablet");
+    sync_once(&tablet.spaces.main(), &tablet.server).unwrap();
+    let (desk, other) = (ada.spaces.main(), tablet.spaces.main());
+    let noted = desk.team_key_record(team).unwrap().expect("the key, noted");
+    assert_eq!(noted.epoch, old_epoch + 1);
+    assert_eq!(other.team_key_record(team).unwrap(), Some(noted));
+    assert!(!other.team_owes_key(team).unwrap());
+    for member in [&olive, &cleo] {
+        let pin = desk.team_pin(team, member.account).unwrap();
+        assert!(pin.is_some());
+        assert_eq!(other.team_pin(team, member.account).unwrap(), pin);
+    }
+
+    // Everybody who is left reads on, under a key an admin made.
+    for member in [&olive, &cleo] {
+        member.pass();
+        let space = member.space(team).unwrap();
+        assert_eq!(
+            space.store.team_state().unwrap().unwrap().epoch,
+            old_epoch + 1
+        );
+        assert_eq!(member.hosts(team), ["after", "bastion"]);
+        assert_eq!(member.password(team, bastion), b"hunter2");
+        assert_eq!(member.password(team, after), b"tr0ub4dor");
+    }
+    // And Dan's device lets go.
+    assert!(dan.pass().status.teams.is_empty());
+    assert!(dan.space(team).is_none());
 }
