@@ -2977,4 +2977,1105 @@ mod teams {
         // And what it still held follows.
         hears(&mut stream, &format!("event: team\ndata: {team}")).await;
     }
+
+    /// UwUAuth deleting a person who alone owns a team with others in it
+    /// would leave the team to nobody: refused, until someone else owns it.
+    #[tokio::test]
+    async fn uwuauth_cannot_delete_the_only_owner_of_a_team() {
+        use super::sso::{create_with, device_of, scim, scim_user, ticket, Provider, SCIM_TOKEN};
+        let provider = Provider::start().await;
+        let server = open().await;
+        provider.pair(&server);
+        let person = scim_user(&server, "owner-1").await;
+        let id = person["id"].as_str().unwrap().to_string();
+        let signed = ticket(&server, &provider, "owner-1").await;
+        let created = create_with(&server, signed["ticket"].as_str().unwrap(), 21).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        let owner = device_of(&created.1, 21);
+        let identity = call(
+            &server,
+            &owner,
+            reqwest::Method::PUT,
+            "/v1/teams/identity",
+            Some(json!({ "public_key": key(21), "sealed_private": wrapped("sealed") })),
+        )
+        .await;
+        assert_eq!(identity.0, 200, "{identity:?}");
+        let team = team(&server, &owner).await;
+        let other = member(&server, 22).await;
+        admit(&server, &owner, team, &other, 22, "editor").await;
+
+        let path = format!("/scim/v2/Users/{id}");
+        let refused = scim(&server, reqwest::Method::DELETE, &path, SCIM_TOKEN, None).await;
+        assert_eq!(refused.0, 409, "{refused:?}");
+        assert_eq!(mine(&server, &other).await.len(), 1);
+
+        // With an admin who can take over, it goes through — and the team
+        // has an owner afterwards.
+        let promoted = patch(
+            &server,
+            &owner,
+            &format!("/v1/teams/{team}/members/{}", other.account),
+            json!({ "role": "admin" }),
+        )
+        .await;
+        assert!(promoted.0 < 300, "{promoted:?}");
+        let deleted = scim(&server, reqwest::Method::DELETE, &path, SCIM_TOKEN, None).await;
+        assert_eq!(deleted.0, 204, "{deleted:?}");
+        let teams = mine(&server, &other).await;
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0]["role"], "owner", "{teams:?}");
+    }
+}
+
+/// Signing in with UwUAuth, against a stand-in for it: an OpenID provider on
+/// a port of its own that signs ID tokens with a key made for the test, and
+/// answers pairing the way UwUAuth does. And SCIM, as UwUAuth drives it.
+mod sso {
+    use super::*;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use uwusync_server::db::sso::{self as people, Pairing};
+    use uwusync_server::sso::s256;
+
+    pub(super) const CLIENT_ID: &str = "uwusync-test";
+    const CLIENT_SECRET: &str = "client-secret-for-tests";
+    pub(super) const SCIM_TOKEN: &str = "scim-token-for-tests";
+    const REDIRECT: &str = "http://127.0.0.1:4000/uwusync/callback";
+
+    /// What the provider hands out for one `code`: the claims, and the PKCE
+    /// challenge the server sent with it.
+    #[derive(Default)]
+    struct Codes {
+        codes: HashMap<String, (Value, String)>,
+        /// Pairing requests, as they arrived.
+        paired: Vec<Value>,
+    }
+
+    pub(super) struct Provider {
+        pub(super) issuer: String,
+        codes: Arc<Mutex<Codes>>,
+        /// What the ID tokens say of the address: vouched for, or not.
+        email_verified: std::sync::atomic::AtomicBool,
+    }
+
+    fn signing_key() -> EcdsaKeyPair {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap()
+    }
+
+    fn sign(key: &EcdsaKeyPair, claims: &Value) -> String {
+        let header = uwusync_server::b64::encode(
+            json!({ "alg": "ES256", "kid": "k1", "typ": "JWT" }).to_string(),
+        );
+        let payload = uwusync_server::b64::encode(claims.to_string());
+        let signed = format!("{header}.{payload}");
+        let signature = key.sign(&SystemRandom::new(), signed.as_bytes()).unwrap();
+        format!(
+            "{signed}.{}",
+            uwusync_server::b64::encode(signature.as_ref())
+        )
+    }
+
+    impl Provider {
+        pub(super) async fn start() -> Provider {
+            use axum::extract::State as S;
+            use axum::routing::{get, post};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let key = Arc::new(signing_key());
+            let codes = Arc::new(Mutex::new(Codes::default()));
+
+            #[derive(Clone)]
+            struct Fake {
+                issuer: String,
+                key: Arc<EcdsaKeyPair>,
+                codes: Arc<Mutex<Codes>>,
+            }
+            let fake = Fake {
+                issuer: issuer.clone(),
+                key: key.clone(),
+                codes: codes.clone(),
+            };
+            let app = axum::Router::new()
+                .route(
+                    "/.well-known/openid-configuration",
+                    get(|S(fake): S<Fake>| async move {
+                        axum::Json(json!({
+                            "issuer": fake.issuer,
+                            "authorization_endpoint": format!("{}/authorize", fake.issuer),
+                            "token_endpoint": format!("{}/token", fake.issuer),
+                            "jwks_uri": format!("{}/jwks", fake.issuer),
+                        }))
+                    }),
+                )
+                .route(
+                    "/jwks",
+                    get(|S(fake): S<Fake>| async move {
+                        let point = fake.key.public_key().as_ref().to_vec();
+                        axum::Json(json!({ "keys": [{
+                            "kty": "EC", "crv": "P-256", "kid": "k1", "alg": "ES256", "use": "sig",
+                            "x": uwusync_server::b64::encode(&point[1..33]),
+                            "y": uwusync_server::b64::encode(&point[33..65]),
+                        }]}))
+                    }),
+                )
+                .route(
+                    "/token",
+                    post(
+                        |S(fake): S<Fake>, headers: axum::http::HeaderMap, form: String| async move {
+                            use axum::response::IntoResponse;
+                            let form: HashMap<String, String> = form
+                                .split('&')
+                                .filter_map(|pair| pair.split_once('='))
+                                .map(|(key, value)| (key.to_string(), decode(value)))
+                                .collect();
+                            let basic = headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string();
+                            let expected = format!(
+                                "Basic {}",
+                                base64_standard(&format!("{CLIENT_ID}:{CLIENT_SECRET}"))
+                            );
+                            let bad = (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(json!({ "error": "invalid_grant" })),
+                            )
+                                .into_response();
+                            if basic != expected || form["redirect_uri"] != REDIRECT {
+                                return bad;
+                            }
+                            let Some((claims, challenge)) =
+                                fake.codes.lock().unwrap().codes.remove(&form["code"])
+                            else {
+                                return bad;
+                            };
+                            if s256(&form["code_verifier"]) != challenge {
+                                return bad;
+                            }
+                            axum::Json(json!({
+                                "id_token": sign(&fake.key, &claims),
+                                "access_token": "an-access-token",
+                                "token_type": "Bearer",
+                            }))
+                            .into_response()
+                        },
+                    ),
+                )
+                .route(
+                    "/uwu/v1/server",
+                    get(|S(fake): S<Fake>| async move {
+                        axum::Json(json!({
+                            "product": "UwUAuth", "pairing": 1, "issuer": fake.issuer,
+                        }))
+                    }),
+                )
+                .route(
+                    "/uwu/v1/pair",
+                    post(
+                        |S(fake): S<Fake>, axum::Json(body): axum::Json<Value>| async move {
+                            use axum::response::IntoResponse;
+                            if body["code"] != "PAIR-CODE" {
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    axum::Json(json!({ "error": "invalid_code" })),
+                                )
+                                    .into_response();
+                            }
+                            fake.codes.lock().unwrap().paired.push(body);
+                            axum::Json(json!({
+                                "issuer": fake.issuer,
+                                "clientId": CLIENT_ID,
+                                "clientSecret": CLIENT_SECRET,
+                                "scopes": ["openid", "email", "profile"],
+                                "scimToken": SCIM_TOKEN,
+                                "appId": "app-1",
+                                "manageUrl": format!("{}/admin/apps/app-1", fake.issuer),
+                            }))
+                            .into_response()
+                        },
+                    ),
+                )
+                .with_state(fake);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Provider {
+                issuer,
+                codes,
+                email_verified: true.into(),
+            }
+        }
+
+        /// Pair `server` with this provider, straight in its database.
+        pub(super) fn pair(&self, server: &Server) {
+            self.pair_at(server, 1);
+        }
+
+        /// Pair anew, as `uwusync uwuauth pair` would while the server runs.
+        pub(super) fn pair_at(&self, server: &Server, paired_ms: u64) {
+            people::set_pairing(
+                &server.state.db.lock(),
+                &Pairing {
+                    url: self.issuer.clone(),
+                    issuer: self.issuer.clone(),
+                    client_id: CLIENT_ID.into(),
+                    client_secret: CLIENT_SECRET.into(),
+                    scim_token_hash: Some(uwusync_server::sha256(SCIM_TOKEN.as_bytes()).to_vec()),
+                    app_id: Some("app-1".into()),
+                    manage_url: None,
+                    paired_ms,
+                },
+            )
+            .unwrap();
+        }
+
+        /// The browser half: what UwUAuth does after the person signed in
+        /// as `sub` — a code for the claims, bound to the server's challenge
+        /// and nonce from the address it was sent to.
+        fn signs_in(&self, url: &str, sub: &str, email: &str) -> (String, String) {
+            let url = reqwest::Url::parse(url).unwrap();
+            assert!(url
+                .as_str()
+                .starts_with(&format!("{}/authorize?", self.issuer)));
+            let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+            assert_eq!(query["client_id"], CLIENT_ID);
+            assert_eq!(query["redirect_uri"], REDIRECT);
+            assert_eq!(query["code_challenge_method"], "S256");
+            assert_eq!(query["scope"], "openid email profile");
+            let now = uwusync_server::now_ms() / 1000;
+            let claims = json!({
+                "iss": self.issuer, "aud": CLIENT_ID, "sub": sub, "email": email,
+                "email_verified": self.email_verified.load(std::sync::atomic::Ordering::SeqCst),
+                "name": "Mia Example", "nonce": query["nonce"],
+                "iat": now, "exp": now + 300,
+            });
+            let code = uwusync_server::b64::encode(uwusync_server::random_bytes::<16>());
+            self.codes
+                .lock()
+                .unwrap()
+                .codes
+                .insert(code.clone(), (claims, query["code_challenge"].clone()));
+            (code, query["state"].clone())
+        }
+    }
+
+    fn decode(value: &str) -> String {
+        let value = value.replace('+', " ");
+        let mut out = Vec::new();
+        let bytes = value.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] == b'%' && at + 2 < bytes.len() {
+                out.push(u8::from_str_radix(&value[at + 1..at + 3], 16).unwrap());
+                at += 3;
+            } else {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn base64_standard(text: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(text)
+    }
+
+    async fn post_json(server: &Server, path: &str, body: Value) -> (u16, Value) {
+        let response = server
+            .client
+            .post(server.url(path))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// The whole device half of a sign-in: a ticket, or the refusal.
+    pub(super) async fn sign_in(
+        server: &Server,
+        provider: &Provider,
+        sub: &str,
+        email: &str,
+    ) -> (u16, Value) {
+        let verifier = uwusync_server::b64::encode(uwusync_server::random_bytes::<32>());
+        let started = post_json(
+            server,
+            "/v1/sso/authorize",
+            json!({ "redirectUri": REDIRECT, "codeChallenge": s256(&verifier) }),
+        )
+        .await;
+        assert_eq!(started.0, 200, "{started:?}");
+        let (code, state) = provider.signs_in(started.1["url"].as_str().unwrap(), sub, email);
+        assert_eq!(state, started.1["state"]);
+        post_json(
+            server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier, "iss": provider.issuer }),
+        )
+        .await
+    }
+
+    pub(super) async fn ticket(server: &Server, provider: &Provider, sub: &str) -> Value {
+        let answer = sign_in(server, provider, sub, &format!("{sub}@example.com")).await;
+        assert_eq!(answer.0, 200, "{answer:?}");
+        answer.1
+    }
+
+    /// An account made with a ticket instead of an invite.
+    pub(super) async fn create_with(server: &Server, ticket: &str, seed: u8) -> (u16, Value) {
+        let signing = Device::new_key(seed);
+        post_json(
+            server,
+            "/v1/accounts",
+            json!({
+                "ssoTicket": ticket,
+                "vault": Server::vault(Uuid::now_v7()),
+                "authKey": login_key("master"),
+                "device": {
+                    "name": "LVDesk1",
+                    "publicKey": uwusync_server::b64::encode(signing.verifying_key().to_bytes()),
+                },
+            }),
+        )
+        .await
+    }
+
+    pub(super) fn device_of(answer: &Value, seed: u8) -> Device {
+        Device {
+            signing: Device::new_key(seed),
+            account: answer["accountId"].as_str().unwrap().parse().unwrap(),
+            id: answer["deviceId"].as_str().unwrap().parse().unwrap(),
+            token: answer["token"].as_str().unwrap().to_string(),
+            vault_id: Uuid::nil(),
+        }
+    }
+
+    async fn enrol_with(server: &Server, ticket: &str, password: &str, seed: u8) -> (u16, Value) {
+        let signing = Device::new_key(seed);
+        post_json(
+            server,
+            "/v1/devices/enrol",
+            json!({
+                "ssoTicket": ticket,
+                "authKey": login_key(password),
+                "device": {
+                    "name": format!("device {seed}"),
+                    "publicKey": uwusync_server::b64::encode(signing.verifying_key().to_bytes()),
+                },
+            }),
+        )
+        .await
+    }
+
+    pub(super) async fn scim(
+        server: &Server,
+        method: reqwest::Method,
+        path: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut request = server
+            .client
+            .request(method, server.url(path))
+            .bearer_auth(token);
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/scim+json")
+                .body(body.to_string());
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        if status != 204 {
+            let kind = response
+                .headers()
+                .get("content-type")
+                .map(|value| value.to_str().unwrap().to_string());
+            assert_eq!(kind.as_deref(), Some("application/scim+json"), "{status}");
+        }
+        let text = response.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub(super) async fn scim_user(server: &Server, sub: &str) -> Value {
+        let created = scim(
+            server,
+            reqwest::Method::POST,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": format!("{sub}@example.com"),
+                "externalId": sub,
+                "displayName": "Mia Example",
+                "active": true,
+            })),
+        )
+        .await;
+        assert_eq!(created.0, 201, "{created:?}");
+        created.1
+    }
+
+    async fn patch_active(server: &Server, id: &str, active: bool) -> (u16, Value) {
+        scim(
+            server,
+            reqwest::Method::PATCH,
+            &format!("/scim/v2/Users/{id}"),
+            SCIM_TOKEN,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [{ "op": "replace", "value": { "active": active } }],
+            })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn signing_in_with_uwuauth_makes_an_account_and_joins_devices_to_it() {
+        let provider = Provider::start().await;
+        // An invite-only server: the ticket stands in for the invite.
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+
+        let first = ticket(&server, &provider, "person-1").await;
+        assert_eq!(first["hasAccount"], false);
+        assert_eq!(first["userName"], "person-1@example.com");
+        assert_eq!(first["displayName"], "Mia Example");
+        let ticket_text = first["ticket"].as_str().unwrap();
+        let created = create_with(&server, ticket_text, 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        let mut device = device_of(&created.1, 1);
+        assert_eq!(device.login(&server).await, 200);
+        // One use.
+        assert_eq!(create_with(&server, ticket_text, 2).await.0, 401);
+
+        // The same person again, on another device: they have an account now,
+        // and a second one is not made for them.
+        let again = ticket(&server, &provider, "person-1").await;
+        assert_eq!(again["hasAccount"], true);
+        let again = again["ticket"].as_str().unwrap();
+        let refused = create_with(&server, again, 3).await;
+        assert_eq!(refused.0, 409, "{refused:?}");
+
+        // The vault parameters with the ticket, then the master password.
+        let params = post_json(&server, "/v1/vault/params", json!({ "ssoTicket": again })).await;
+        assert_eq!(params.0, 200, "{params:?}");
+        // A wrong one costs a try and not the ticket…
+        assert_eq!(enrol_with(&server, again, "wrong", 4).await.0, 401);
+        // …the right one lets the device in, and the ticket is spent.
+        let joined = enrol_with(&server, again, "master", 4).await;
+        assert_eq!(joined.0, 200, "{joined:?}");
+        assert_eq!(joined.1["accountId"], device.account.to_string());
+        assert_eq!(enrol_with(&server, again, "master", 5).await.0, 401);
+
+        // Somebody else gets an account of their own.
+        let other = ticket(&server, &provider, "person-2").await;
+        assert_eq!(other["hasAccount"], false);
+        let made = create_with(&server, other["ticket"].as_str().unwrap(), 6).await;
+        assert_eq!(made.0, 200);
+        assert_ne!(made.1["accountId"], device.account.to_string());
+
+        // An address UwUAuth does not vouch for names nobody: the `sub` does.
+        provider
+            .email_verified
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let unverified = ticket(&server, &provider, "person-3").await;
+        assert_eq!(unverified["userName"], "person-3");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_only_for_the_one_who_started_the_login() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+
+        // Not paired: no signing in.
+        let off = post_json(
+            &server,
+            "/v1/sso/authorize",
+            json!({ "redirectUri": REDIRECT, "codeChallenge": s256(&"v".repeat(43)) }),
+        )
+        .await;
+        assert_eq!(off.0, 404, "{off:?}");
+        provider.pair(&server);
+
+        // Only the device's own loopback listener is a place to come back to.
+        for redirect in [
+            "http://localhost:4000/uwusync/callback",
+            "https://sync.example.com/uwusync/callback",
+            "http://127.0.0.1:4000/elsewhere",
+        ] {
+            let answer = post_json(
+                &server,
+                "/v1/sso/authorize",
+                json!({ "redirectUri": redirect, "codeChallenge": s256(&"v".repeat(43)) }),
+            )
+            .await;
+            assert_eq!(answer.0, 400, "{redirect}");
+        }
+
+        let verifier = "v".repeat(43);
+        let started = post_json(
+            &server,
+            "/v1/sso/authorize",
+            json!({ "redirectUri": REDIRECT, "codeChallenge": s256(&verifier) }),
+        )
+        .await;
+        let (code, state) =
+            provider.signs_in(started.1["url"].as_str().unwrap(), "p", "p@example.com");
+        // Somebody who saw the code and the state but not the verifier.
+        let stolen = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": "w".repeat(43) }),
+        )
+        .await;
+        assert_eq!(stolen.0, 401);
+        // That does not use up the device's login: the right verifier still
+        // finishes it…
+        let own = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier }),
+        )
+        .await;
+        assert_eq!(own.0, 200, "{own:?}");
+        // …once: the state is gone with that.
+        let late = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier }),
+        )
+        .await;
+        assert_eq!(late.0, 401);
+
+        // An answer that names another issuer came from somewhere else.
+        let started = post_json(
+            &server,
+            "/v1/sso/authorize",
+            json!({ "redirectUri": REDIRECT, "codeChallenge": s256(&verifier) }),
+        )
+        .await;
+        let (code, state) =
+            provider.signs_in(started.1["url"].as_str().unwrap(), "p", "p@example.com");
+        let mixed = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier,
+                    "iss": "https://auth.example.net" }),
+        )
+        .await;
+        assert_eq!(mixed.0, 401);
+
+        // A made-up ticket is no invite.
+        assert_eq!(create_with(&server, "made-up", 1).await.0, 401);
+        // Paired anew while the server runs — from the command line, which
+        // the running server is not told about: tickets and logins from
+        // before are worth nothing.
+        let old = ticket(&server, &provider, "p").await;
+        let started = post_json(
+            &server,
+            "/v1/sso/authorize",
+            json!({ "redirectUri": REDIRECT, "codeChallenge": s256(&verifier) }),
+        )
+        .await;
+        let (code, state) =
+            provider.signs_in(started.1["url"].as_str().unwrap(), "p", "p@example.com");
+        provider.pair_at(&server, 2);
+        assert_eq!(
+            create_with(&server, old["ticket"].as_str().unwrap(), 1)
+                .await
+                .0,
+            401
+        );
+        let pending = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier }),
+        )
+        .await;
+        assert_eq!(pending.0, 401);
+
+        // And unpaired, a ticket from before is worth nothing.
+        let ticket = ticket(&server, &provider, "p").await;
+        people::unpair(&server.state.db.lock()).unwrap();
+        assert_eq!(
+            create_with(&server, ticket["ticket"].as_str().unwrap(), 1)
+                .await
+                .0,
+            404
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_says_what_it_is_and_whom_it_signs_in_with() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        let info: Value = server
+            .client
+            .get(server.url("/uwu/v1/server"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info["product"], "UwUSync");
+        assert_eq!(info["sso"], false);
+        provider.pair(&server);
+        let suite: Value = server
+            .client
+            .get(server.url("/.well-known/uwusuite"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(suite["sso"], true);
+        assert_eq!(suite["servers"][1]["product"], "UwUAuth");
+        assert_eq!(suite["servers"][1]["issuer"], provider.issuer);
+        // Nothing secret in either.
+        assert!(!suite.to_string().contains(CLIENT_SECRET));
+    }
+
+    #[tokio::test]
+    async fn pairing_takes_a_code_from_uwuauth_and_keeps_what_it_answers() {
+        let provider = Provider::start().await;
+        let server = start_with(Config {
+            public: Some("https://sync.example.com".into()),
+            ..Config::default()
+        })
+        .await;
+        let wrong = uwusync_server::uwuauth::pair(
+            &server.state.config,
+            &server.state.db,
+            Some(&provider.issuer),
+            "WRONG",
+        )
+        .await;
+        assert!(wrong.unwrap_err().contains("does not know this code"));
+
+        let said = uwusync_server::uwuauth::pair(
+            &server.state.config,
+            &server.state.db,
+            None,
+            &format!("{}/#pair=PAIR-CODE", provider.issuer),
+        )
+        .await
+        .unwrap();
+        assert!(said.contains("Paired"), "{said}");
+        let asked = provider.codes.lock().unwrap().paired.pop().unwrap();
+        assert_eq!(asked["app"]["product"], "UwUSync");
+        assert_eq!(
+            asked["app"]["redirectUris"],
+            json!(["http://127.0.0.1/uwusync/callback"])
+        );
+        assert_eq!(
+            asked["app"]["scim"]["baseUrl"],
+            "https://sync.example.com/scim/v2"
+        );
+        let kept = people::pairing(&server.state.db.lock()).unwrap().unwrap();
+        assert_eq!(kept.issuer, provider.issuer);
+        assert_eq!(kept.client_secret, CLIENT_SECRET);
+        assert!(people::scim_token_matches(&server.state.db.lock(), SCIM_TOKEN).unwrap());
+        // And it signs in at once.
+        let ticket = ticket(&server, &provider, "paired").await;
+        assert_eq!(ticket["hasAccount"], false);
+
+        // Without an https address of its own, it does not pair.
+        let plain = start(Registration::Invite).await;
+        let refused = uwusync_server::uwuauth::pair(
+            &plain.state.config,
+            &plain.state.db,
+            Some(&provider.issuer),
+            "PAIR-CODE",
+        )
+        .await;
+        assert!(refused.is_err());
+    }
+
+    #[tokio::test]
+    async fn scim_is_for_uwuauth_and_its_token_only() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        // Unpaired, no token is right.
+        let answer = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(answer.0, 401);
+        provider.pair(&server);
+        let config = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/ServiceProviderConfig",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(config.0, 200);
+        assert_eq!(config.1["patch"]["supported"], true);
+        // Guessing is slowed down — and the slowdown is for the guesser.
+        let mut statuses = Vec::new();
+        for _ in 0..12 {
+            statuses.push(
+                scim(
+                    &server,
+                    reqwest::Method::GET,
+                    "/scim/v2/Users",
+                    "guess",
+                    None,
+                )
+                .await
+                .0,
+            );
+        }
+        assert_eq!(statuses[0], 401);
+        assert_eq!(*statuses.last().unwrap(), 429);
+        // UwUAuth itself, from the same address, is never slowed down.
+        for _ in 0..3 {
+            let pushed = scim(
+                &server,
+                reqwest::Method::GET,
+                "/scim/v2/Users",
+                SCIM_TOKEN,
+                None,
+            )
+            .await;
+            assert_eq!(pushed.0, 200, "{pushed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scim_keeps_people_and_turning_one_off_shuts_their_devices_out() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+
+        // Pushed before they ever signed in: pending, found by their `sub`.
+        let pushed = scim_user(&server, "person-1").await;
+        let id = pushed["id"].as_str().unwrap().to_string();
+        assert_eq!(pushed["externalId"], "person-1");
+        assert_eq!(pushed["active"], true);
+        // Pushed again: the same person, updated, with the same id.
+        let again = scim(
+            &server,
+            reqwest::Method::POST,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            Some(
+                json!({ "userName": "person-1@example.com", "externalId": "person-1",
+                         "displayName": "Mia E." }),
+            ),
+        )
+        .await;
+        assert_eq!(again.0, 200, "{again:?}");
+        assert_eq!(again.1["id"], id);
+        assert_eq!(again.1["displayName"], "Mia E.");
+        let missing = scim(
+            &server,
+            reqwest::Method::POST,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            Some(json!({ "userName": "nobody@example.com" })),
+        )
+        .await;
+        assert_eq!(missing.0, 400);
+        let found = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/Users?filter=userName%20eq%20%22person-1%40example.com%22",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(found.1["totalResults"], 1);
+        assert_eq!(found.1["Resources"][0]["id"], id);
+
+        let ticket = ticket(&server, &provider, "person-1").await;
+        let created = create_with(&server, ticket["ticket"].as_str().unwrap(), 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        let mut device = device_of(&created.1, 1);
+        // Still one person.
+        let all = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(all.1["totalResults"], 1);
+
+        // The account's external id is not UwUAuth's to move.
+        let moved = scim(
+            &server,
+            reqwest::Method::PATCH,
+            &format!("/scim/v2/Users/{id}"),
+            SCIM_TOKEN,
+            Some(json!({ "Operations": [{ "op": "replace", "path": "externalId", "value": "person-9" }] })),
+        )
+        .await;
+        assert_eq!(moved.0, 400, "{moved:?}");
+
+        // Off: every device is out at once, and signing in is refused.
+        let off = patch_active(&server, &id, false).await;
+        assert_eq!(off.0, 200, "{off:?}");
+        assert_eq!(off.1["active"], false);
+        let pull = server
+            .client
+            .get(server.url("/v1/records?since=0"))
+            .bearer_auth(&device.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), 401);
+        assert_ne!(device.login(&server).await, 200);
+        let refused = sign_in(&server, &provider, "person-1", "person-1@example.com").await;
+        assert_eq!(refused.0, 403, "{refused:?}");
+
+        // On again: the account is still there, and joining it takes the
+        // master password as ever.
+        assert_eq!(patch_active(&server, &id, true).await.0, 200);
+        let again = super::sso::ticket(&server, &provider, "person-1").await;
+        assert_eq!(again["hasAccount"], true);
+        let joined = enrol_with(&server, again["ticket"].as_str().unwrap(), "master", 2).await;
+        assert_eq!(joined.0, 200, "{joined:?}");
+        assert_eq!(joined.1["accountId"], device.account.to_string());
+
+        // Deleted: the account goes with them.
+        let gone = scim(
+            &server,
+            reqwest::Method::DELETE,
+            &format!("/scim/v2/Users/{id}"),
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(gone.0, 204);
+        let joined = device_of(&joined.1, 2);
+        let pull = server
+            .client
+            .get(server.url("/v1/records?since=0"))
+            .bearer_auth(&joined.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), 401);
+        assert!(
+            uwusync_server::db::accounts::header(&server.state.db.lock(), device.account)
+                .unwrap()
+                .is_none()
+        );
+        let after = scim(
+            &server,
+            reqwest::Method::GET,
+            &format!("/scim/v2/Users/{id}"),
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(after.0, 404);
+        // Signing in again makes a new, empty account — not the old one.
+        let fresh = super::sso::ticket(&server, &provider, "person-1").await;
+        assert_eq!(fresh["hasAccount"], false);
+    }
+
+    #[tokio::test]
+    async fn a_person_who_signed_in_before_uwuauth_pushed_them_is_the_same_person() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+
+        // Signed in first, with an account and a device…
+        let first = ticket(&server, &provider, "person-1").await;
+        let created = create_with(&server, first["ticket"].as_str().unwrap(), 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        let mut device = device_of(&created.1, 1);
+        // …then UwUAuth pushes them: no conflict, the person they are.
+        let pushed = scim(
+            &server,
+            reqwest::Method::POST,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": "mia@example.com",
+                "externalId": "person-1",
+                "displayName": "Mia Example",
+                "active": true,
+            })),
+        )
+        .await;
+        assert!(matches!(pushed.0, 200 | 201), "{pushed:?}");
+        assert_eq!(pushed.1["userName"], "mia@example.com");
+        let id = pushed.1["id"].as_str().unwrap().to_string();
+        let all = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(all.1["totalResults"], 1);
+        assert_eq!(all.1["Resources"][0]["id"], id);
+
+        // Turned off by that id: their device is out.
+        assert_eq!(patch_active(&server, &id, false).await.0, 200);
+        let pull = server
+            .client
+            .get(server.url("/v1/records?since=0"))
+            .bearer_auth(&device.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), 401);
+        assert_ne!(device.login(&server).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_spent_only_once_the_account_is_made() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+        let first = ticket(&server, &provider, "person-1").await;
+        let ticket_text = first["ticket"].as_str().unwrap();
+
+        // Making the account fails halfway: nothing is kept, and the ticket
+        // is still good.
+        server
+            .state
+            .db
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER no_devices BEFORE INSERT ON devices
+                 BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;",
+            )
+            .unwrap();
+        let failed = create_with(&server, ticket_text, 1).await;
+        assert_eq!(failed.0, 500, "{failed:?}");
+        assert_eq!(
+            uwusync_server::db::accounts::count(&server.state.db.lock()).unwrap(),
+            0
+        );
+        server
+            .state
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER no_devices;")
+            .unwrap();
+        let created = create_with(&server, ticket_text, 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        assert_eq!(create_with(&server, ticket_text, 2).await.0, 401);
+    }
+
+    #[tokio::test]
+    async fn joining_with_uwuauth_is_limited_per_account() {
+        let provider = Provider::start().await;
+        let server = start_with(Config {
+            registration: Registration::Invite,
+            trust_forwarded: true,
+            ..Config::default()
+        })
+        .await;
+        provider.pair(&server);
+        let first = ticket(&server, &provider, "person-1").await;
+        let created = create_with(&server, first["ticket"].as_str().unwrap(), 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+
+        // From a new address every time, so only the count per account
+        // stands in the way.
+        let mut tries = 0u8;
+        let mut join = |ticket: String, password: &'static str| {
+            tries += 1;
+            let address = format!("198.51.100.{tries}");
+            let signing = Device::new_key(10 + tries);
+            let request = server
+                .client
+                .post(server.url("/v1/devices/enrol"))
+                .header("x-forwarded-for", address)
+                .json(&json!({
+                    "ssoTicket": ticket,
+                    "authKey": login_key(password),
+                    "device": {
+                        "name": "joining",
+                        "publicKey": uwusync_server::b64::encode(signing.verifying_key().to_bytes()),
+                    },
+                }));
+            async move { request.send().await.unwrap().status().as_u16() }
+        };
+        let max = uwusync_server::limits::SSO_JOINS.max;
+        let mut ticket_text = String::new();
+        for at in 0..max {
+            if at % (uwusync_server::sso::TICKET_TRIES as usize - 1) == 0 {
+                let fresh = ticket(&server, &provider, "person-1").await;
+                ticket_text = fresh["ticket"].as_str().unwrap().to_string();
+            }
+            assert_eq!(join(ticket_text.clone(), "wrong").await, 401);
+        }
+        // The right password, a fresh ticket: still too many for one account.
+        let fresh = ticket(&server, &provider, "person-1").await;
+        let fresh = fresh["ticket"].as_str().unwrap().to_string();
+        assert_eq!(join(fresh, "master").await, 429);
+    }
+
+    #[tokio::test]
+    async fn groups_are_taken_and_forgotten() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+        let group = scim(
+            &server,
+            reqwest::Method::POST,
+            "/scim/v2/Groups",
+            SCIM_TOKEN,
+            Some(json!({ "displayName": "Ops", "members": [] })),
+        )
+        .await;
+        assert_eq!(group.0, 201);
+        let id = group.1["id"].as_str().unwrap();
+        let patched = scim(
+            &server,
+            reqwest::Method::PATCH,
+            &format!("/scim/v2/Groups/{id}"),
+            SCIM_TOKEN,
+            Some(json!({ "Operations": [{ "op": "add", "path": "members", "value": [] }] })),
+        )
+        .await;
+        assert_eq!(patched.0, 204);
+        let list = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/Groups",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(list.1["totalResults"], 0);
+        let deleted = scim(
+            &server,
+            reqwest::Method::DELETE,
+            &format!("/scim/v2/Groups/{id}"),
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(deleted.0, 204);
+    }
 }

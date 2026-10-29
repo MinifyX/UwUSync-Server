@@ -7,7 +7,7 @@
 //! one alone gets nowhere, which is what makes an intercepted pairing code
 //! worthless.
 
-use super::{auth_key, device_key, who, Admitted, Peer};
+use super::{auth_key, device_key, sso, who, Admitted, Peer};
 use crate::auth::Authenticated;
 use crate::db::{accounts, devices, invites};
 use crate::limits;
@@ -59,19 +59,46 @@ pub async fn enrol(
     let device_key = device_key(&request.device)?;
 
     let conn = state.db.lock();
+    let mut sso_join = None;
     // Look first, spend later: a mistyped password must not use up the token
     // the other device just showed on its screen. But only a few times — a
     // token is not a licence to guess the password with.
-    let account =
-        invites::peek_enrolment(&conn, &request.enrolment)?.ok_or(ApiError::Unauthorized)?;
-    if !accounts::verify(&conn, account, &key)? {
-        let spent = invites::enrolment_failed(&conn, &request.enrolment)?;
-        tracing::warn!(%account, spent, "a join with the wrong master password");
-        return Err(ApiError::Unauthorized);
-    }
-    if invites::redeem_enrolment(&conn, &request.enrolment)?.is_none() {
-        return Err(ApiError::Unauthorized);
-    }
+    let account = match &request.sso_ticket {
+        // Signed in with UwUAuth: the ticket says who, the master password
+        // still has to open the account — UwUAuth never knows it.
+        Some(ticket) => {
+            let now = state.clock.now_ms();
+            let person = sso::ticket_person(&state, &conn, ticket, now)?;
+            let account = person.account_id.ok_or(ApiError::Unauthorized)?;
+            if let Err(error) = state.limits.check_account(account, &limits::SSO_JOINS) {
+                tracing::warn!(%account, person = %person.id, "too many joins with UwUAuth; refused");
+                return Err(error);
+            }
+            if !accounts::verify(&conn, account, &key)? {
+                let spent = state.sso.failed(ticket);
+                tracing::warn!(%account, spent, "a join with UwUAuth and the wrong master password");
+                return Err(ApiError::Unauthorized);
+            }
+            if state.sso.spend(ticket, now) != Some(person.id) {
+                return Err(ApiError::Unauthorized);
+            }
+            sso_join = Some(person.id);
+            account
+        }
+        None => {
+            let account = invites::peek_enrolment(&conn, &request.enrolment)?
+                .ok_or(ApiError::Unauthorized)?;
+            if !accounts::verify(&conn, account, &key)? {
+                let spent = invites::enrolment_failed(&conn, &request.enrolment)?;
+                tracing::warn!(%account, spent, "a join with the wrong master password");
+                return Err(ApiError::Unauthorized);
+            }
+            if invites::redeem_enrolment(&conn, &request.enrolment)?.is_none() {
+                return Err(ApiError::Unauthorized);
+            }
+            account
+        }
+    };
     let device = devices::add(&conn, account, &request.device.name, &device_key)?;
     drop(conn);
 
@@ -80,7 +107,15 @@ pub async fn enrol(
         state
             .sessions
             .issue(account, device.id, state.config.session_secs * 1000);
-    tracing::info!(%account, device = %device.id, "a device joined");
+    match sso_join {
+        // Audit trail: a device that came in with a UwUAuth sign-in rather
+        // than one shown by a device already in.
+        Some(person) => tracing::info!(
+            %account, device = %device.id, %person,
+            "a device joined with a UwUAuth sign-in"
+        ),
+        None => tracing::info!(%account, device = %device.id, "a device joined"),
+    }
     Ok(Json(Admitted {
         account_id: account,
         device_id: device.id,

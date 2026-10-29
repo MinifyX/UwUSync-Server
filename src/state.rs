@@ -4,6 +4,7 @@ use crate::auth::{Challenges, Sessions};
 use crate::db::Db;
 use crate::limits::RateLimiter;
 use crate::pairing::Pairings;
+use crate::sso::SsoStore;
 use crate::Config;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -23,6 +24,10 @@ pub struct AppState {
     pub events: Events,
     pub pairings: Pairings,
     pub clock: Clock,
+    /// Logins with UwUAuth in progress, and the tickets they ended in.
+    pub sso: SsoStore,
+    /// UwUAuth's discovery document and keys, fetched once.
+    pub oidc: Arc<crate::oidc::Cache>,
 }
 
 /// What time it is, for whatever runs out: a team invite, so far. The
@@ -56,6 +61,8 @@ impl AppState {
             events: Events::default(),
             pairings: Pairings::default(),
             clock: Clock::default(),
+            sso: SsoStore::default(),
+            oidc: Arc::default(),
         }
     }
 }

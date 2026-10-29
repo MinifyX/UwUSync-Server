@@ -13,7 +13,7 @@ use uuid::Uuid;
 use uwusync_server::api;
 use uwusync_server::config::TlsMode;
 use uwusync_server::db::{accounts, devices, invites, records, teams, with_suffix, Db};
-use uwusync_server::{connections, health, now_ms, tls, updates, AppState, Config};
+use uwusync_server::{connections, date, health, now_ms, tls, updates, uwuauth, AppState, Config};
 
 #[derive(Parser)]
 #[command(
@@ -64,9 +64,31 @@ enum Command {
     /// Ask the running server whether it is well. The container's health
     /// check: the image has no shell and no curl, so the server asks itself.
     Health,
+    /// Sign in with UwUAuth: pair with it, see the pairing, or end it.
+    Uwuauth {
+        #[command(subcommand)]
+        command: Uwuauth,
+    },
     /// Make a new certificate key, because the old one is lost for good.
     /// Every device pinned the old one and has to be set up again.
     NewKey,
+}
+
+#[derive(Subcommand)]
+enum Uwuauth {
+    /// Pair with UwUAuth, with a pairing code made there. Needs
+    /// UWUSYNC_PUBLIC at an https address.
+    Pair {
+        /// UwUAuth's address, `https://auth.example.com` — or leave it out
+        /// and give the code with the address in it (`<address>#pair=<code>`).
+        url: String,
+        /// The pairing code, when the address is given on its own.
+        code: Option<String>,
+    },
+    /// Show the pairing.
+    Status,
+    /// Forget the pairing. Accounts and devices stay.
+    Unpair,
 }
 
 fn main() -> Result<(), String> {
@@ -126,6 +148,25 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Serve => serve(db, config),
+        Command::Uwuauth { command } => {
+            let said = match command {
+                Uwuauth::Pair { url, code } => {
+                    let (url, code) = match code {
+                        Some(code) => (Some(url), code),
+                        None => (None, url),
+                    };
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?
+                        .block_on(uwuauth::pair(&config, &db, url.as_deref(), &code))?
+                }
+                Uwuauth::Status => uwuauth::status(&db)?,
+                Uwuauth::Unpair => uwuauth::unpair(&db)?,
+            };
+            println!("{said}");
+            Ok(())
+        }
         Command::Invite => {
             let code = {
                 let conn = db.lock();
@@ -662,23 +703,6 @@ fn setup_code(config: &Config, invite: &str, fingerprint: Option<&str>) -> Strin
         body["f"] = serde_json::json!(fingerprint);
     }
     format!("uwu1_{}", uwusync_server::b64::encode(body.to_string()))
-}
-
-/// `YYYY-MM-DD` from milliseconds since the epoch, without pulling in a date
-/// library for one line of output. (Howard Hinnant's civil-from-days.)
-fn date(ms: u64) -> String {
-    let days = (ms / 86_400_000) as i64;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// `YYYY-MM-DD-HHMMSS`, in UTC. Sorts the way it reads.

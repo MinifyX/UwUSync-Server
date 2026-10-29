@@ -24,10 +24,14 @@ pub mod db;
 pub mod error;
 pub mod health;
 pub mod limits;
+pub mod oidc;
+pub mod outbound;
 pub mod pairing;
+pub mod sso;
 pub mod state;
 pub mod tls;
 pub mod updates;
+pub mod uwuauth;
 pub mod wire;
 
 pub use config::Config;
@@ -61,6 +65,35 @@ pub mod b64 {
 /// without the letters that look like digits, because a code gets read aloud
 /// and typed in.
 pub(crate) const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
+
+/// `YYYY-MM-DD` from milliseconds since the epoch, without pulling in a date
+/// library for one line of output. (Howard Hinnant's civil-from-days.)
+pub fn date(ms: u64) -> String {
+    let days = (ms / 86_400_000) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` (RFC 3339, UTC) from milliseconds since the epoch.
+pub fn rfc3339(ms: u64) -> String {
+    let seconds = (ms / 1000) % 86_400;
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        date(ms),
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
 
 /// Random bytes from the operating system.
 pub fn random_bytes<const N: usize>() -> [u8; N] {

@@ -1080,6 +1080,14 @@ pub struct Left {
 /// needs a rotation, as after any other removal.
 pub fn forget_account(conn: &mut Connection, account: Uuid) -> Result<Left> {
     let tx = conn.transaction()?;
+    let left = forget_account_in(&tx, account)?;
+    tx.commit()?;
+    Ok(left)
+}
+
+/// [`forget_account`] inside a transaction the caller holds, so it can go
+/// together with the rest of deleting an account.
+pub fn forget_account_in(tx: &Connection, account: Uuid) -> Result<Left> {
     let mut left = Left::default();
     let teams: Vec<(Uuid, bool)> = {
         let mut stmt =
@@ -1097,15 +1105,15 @@ pub fn forget_account(conn: &mut Connection, account: Uuid) -> Result<Left> {
         "DELETE FROM team_invites WHERE created_by = ?1",
         [account.to_string()],
     )?;
-    forget_cursors_of(&tx, None, account)?;
+    forget_cursors_of(tx, None, account)?;
     tx.execute(
         "DELETE FROM team_identities WHERE account_id = ?1",
         [account.to_string()],
     )?;
     for (team, had_key) in teams {
         let id = team.to_string();
-        if member_count(&tx, team)? == 0 {
-            delete_rows(&tx, team)?;
+        if member_count(tx, team)? == 0 {
+            delete_rows(tx, team)?;
             left.deleted.push(team);
             continue;
         }
@@ -1133,7 +1141,6 @@ pub fn forget_account(conn: &mut Connection, account: Uuid) -> Result<Left> {
             left.ownerless.push(team);
         }
     }
-    tx.commit()?;
     Ok(left)
 }
 

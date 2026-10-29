@@ -4,7 +4,9 @@ pub mod accounts;
 pub mod devices;
 pub mod pairing;
 pub mod records;
+pub mod scim;
 pub mod session;
+pub mod sso;
 pub mod teams;
 
 use crate::auth::Authenticated;
@@ -47,6 +49,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/uwu/v1/server", get(sso::server))
+        .route("/.well-known/uwusuite", get(sso::well_known))
+        .route("/v1/sso/authorize", post(sso::authorize))
+        .route("/v1/sso/token", post(sso::token))
+        .merge(scim::routes())
         .route("/v1/accounts", post(accounts::create))
         .route("/v1/vault", get(accounts::vault))
         .route("/v1/vault/params", post(accounts::vault_params))
