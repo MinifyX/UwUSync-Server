@@ -6,7 +6,7 @@
 //! it knows the password, and the parameters alone are handed to a device that
 //! is in the middle of joining. Those are two different endpoints on purpose.
 
-use super::{auth_key, device_key, who, Admitted, Peer};
+use super::{auth_key, device_key, sso, who, Admitted, Peer};
 use crate::auth::Authenticated;
 use crate::config::Registration;
 use crate::db::accounts::{plausible, VaultHeader, VaultParams};
@@ -56,7 +56,26 @@ pub async fn create(
     if accounts::count(&conn)? as u64 >= state.config.max_accounts {
         return Err(ApiError::ServerFull);
     }
+    // Signed in with UwUAuth: the ticket stands in for the invite, whatever
+    // the registration mode says — UwUAuth decided who may.
+    let person = match &request.sso_ticket {
+        Some(ticket) => {
+            let now = state.clock.now_ms();
+            let person = sso::ticket_person(&state, &conn, ticket, now)?;
+            if person.account_id.is_some() {
+                return Err(ApiError::Conflict(
+                    "this person has an account here already: join it instead".into(),
+                ));
+            }
+            if state.sso.spend(ticket, now) != Some(person.id) {
+                return Err(ApiError::Unauthorized);
+            }
+            Some(person)
+        }
+        None => None,
+    };
     match state.config.registration {
+        _ if person.is_some() => {}
         Registration::Closed => return Err(ApiError::RegistrationClosed),
         Registration::Invite => {
             if !invites::redeem_invite(&conn, &request.invite)? {
@@ -70,6 +89,9 @@ pub async fn create(
 
     let account = accounts::create(&conn, &request.vault, &key)?;
     let device = devices::add(&conn, account.id, &request.device.name, &device_key)?;
+    if let Some(person) = &person {
+        crate::db::sso::link(&conn, person.id, account.id)?;
+    }
     drop(conn);
 
     let (token, expires_ms) =
@@ -78,7 +100,10 @@ pub async fn create(
             .issue(account.id, device.id, state.config.session_secs * 1000);
     // No device name: that is whatever somebody typed, and the log is read by
     // people and by install.sh.
-    tracing::info!(account = %account.id, device = %device.id, "account created");
+    tracing::info!(
+        account = %account.id, device = %device.id, sso = person.is_some(),
+        "account created"
+    );
     Ok(Json(Admitted {
         account_id: account.id,
         device_id: device.id,
@@ -115,8 +140,16 @@ pub async fn vault_params(
     let request: VaultParamsRequest = super::body(&state, request).await?;
 
     let conn = state.db.lock();
-    let account =
-        invites::peek_enrolment(&conn, &request.enrolment)?.ok_or(ApiError::Unauthorized)?;
+    let account = match &request.sso_ticket {
+        // Signed in with UwUAuth: the ticket of a person with an account
+        // here, instead of an enrolment token.
+        Some(ticket) => sso::ticket_person(&state, &conn, ticket, state.clock.now_ms())?
+            .account_id
+            .ok_or(ApiError::Unauthorized)?,
+        None => {
+            invites::peek_enrolment(&conn, &request.enrolment)?.ok_or(ApiError::Unauthorized)?
+        }
+    };
     let header = accounts::header(&conn, account)?.ok_or(ApiError::Unauthorized)?;
     Ok(Json(header.params()))
 }

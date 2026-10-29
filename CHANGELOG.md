@@ -3,6 +3,34 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
+## 0.4.0
+
+**Signing in with UwUAuth.** A server paired with UwUAuth lets people make an account, and add a
+device to one, by signing in there instead of with an invite or an enrolment token. The master
+password and the account key stay what they were: UwUAuth says who somebody is, never what opens
+their vault, and can neither read nor reset it. It needs UwUSSH 0.4; older clients sync as
+before. How it works, and what an operator sets, is in [docs/sso.md](docs/sso.md).
+
+- **Pairing from the command line.** `uwusync-server uwuauth pair <address> <code>` with a code
+  made in UwUAuth; `uwuauth status` says what it is paired with, `uwuauth unpair` forgets it. The
+  OpenID Connect client and a hash of the SCIM token are kept in the database, and a running
+  server picks a pairing up at once.
+- **The browser on the device, the secret on the server.** The device opens the system browser
+  and listens on its own loopback address; the server is the OpenID Connect client, with PKCE,
+  state and nonce, and checks the ID token itself. What the device gets is a ticket for five
+  minutes and one use, bound to the device's own PKCE pair, that stands in for the invite.
+- **SCIM.** UwUAuth pushes who may sign in to `/scim/v2/Users`. Somebody pushed and not yet signed
+  in is kept as pending. `active: false` shuts all their devices out at once and keeps their
+  data; `active: true` lets them back in with their master password. Deleting somebody deletes
+  their account, unless they are the only owner of a team that has other members: that is
+  refused with 409 until another member is an owner. Groups are taken and ignored.
+- **Discovery.** `/uwu/v1/server` and `/.well-known/uwusuite` say what this server is and whether
+  it signs in with UwUAuth.
+- **`UWUSYNC_UWUAUTH_CA`** names extra roots to trust for UwUAuth, for one behind a private CA.
+- Invites, enrolment tokens and open registration stay as they are; `UWUSYNC_REGISTRATION=closed`
+  also refuses new accounts by UwUAuth. The database is upgraded in place at the first start; a
+  backup from 0.3 can be restored into 0.4, not the other way round.
+
 ## 0.3.0
 
 **Teams.** A team is a vault that several accounts share: hosts, keys and snippets a group works

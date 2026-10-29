@@ -22,6 +22,19 @@ pub enum ApiError {
     Unauthorized,
     #[error("registration is closed on this server")]
     RegistrationClosed,
+    /// UwUAuth says this person may not come in (any more). Not 401: signing
+    /// in again changes nothing until somebody there changes it.
+    #[error("this account is disabled in UwUAuth")]
+    Disabled,
+    /// Signing in with UwUAuth is not set up here.
+    #[error("this server is not paired with UwUAuth")]
+    SsoOff,
+    /// UwUAuth did not answer, or not the way it should have.
+    #[error("{0}")]
+    Upstream(String),
+    /// A SCIM request that clashes with what is there.
+    #[error("{0}")]
+    Conflict(String),
     /// A proof of the master password that did not check out, from a device
     /// that is signed in. Not 401: that means "sign in again", and a device
     /// would do exactly that and ask a second time.
@@ -138,6 +151,10 @@ impl ApiError {
             Self::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::RegistrationClosed => (StatusCode::FORBIDDEN, "registration-closed"),
+            Self::Disabled => (StatusCode::FORBIDDEN, "account-disabled"),
+            Self::SsoOff => (StatusCode::NOT_FOUND, "sso-off"),
+            Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream"),
+            Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::WrongPassword => (StatusCode::FORBIDDEN, "wrong-password"),
             Self::ServerFull => (StatusCode::FORBIDDEN, "server-full"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not-found"),

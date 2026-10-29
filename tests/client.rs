@@ -14,7 +14,7 @@
 
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use uwussh_proto::api::{CreateAccount, EnrolDevice, NewDevice};
+use uwussh_proto::api::{CreateAccount, EnrolDevice, NewDevice, VaultParamsRequest};
 use uwussh_store::{AuthMethod, HostDraft, PasswordChange, SecretText, Store};
 use uwussh_sync::{from_wire, sync_once, to_wire, Server};
 use uwussh_vault::{AccountKey, KdfParams};
@@ -143,6 +143,7 @@ fn a_host_saved_on_one_device_turns_up_on_the_one_that_joined() {
     let admitted = server
         .create_account(&CreateAccount {
             invite: String::new(),
+            sso_ticket: None,
             vault: to_wire(&header),
             auth_key: b64::encode(*login_key),
             device: NewDevice {
@@ -182,7 +183,12 @@ fn a_host_saved_on_one_device_turns_up_on_the_one_that_joined() {
     let joining = Server::connect(&running.url, None).unwrap();
     // Before it can prove anything, it needs the salt and the costs — and is
     // told that the account key is wanted as well.
-    let params = joining.vault_params(&enrolment.token).unwrap();
+    let params = joining
+        .vault_params(&VaultParamsRequest {
+            enrolment: enrolment.token.clone(),
+            sso_ticket: None,
+        })
+        .unwrap();
     assert_eq!(params.vault_id, header.vault_id);
     assert!(
         params.needs_account_key,
@@ -193,6 +199,7 @@ fn a_host_saved_on_one_device_turns_up_on_the_one_that_joined() {
     let admitted = joining
         .enrol(&EnrolDevice {
             enrolment: enrolment.token.clone(),
+            sso_ticket: None,
             auth_key: b64::encode(*login_key),
             device: NewDevice {
                 name: "LVLaptop".into(),
@@ -254,6 +261,7 @@ fn the_relay_carries_what_the_two_devices_say_to_each_other() {
     let admitted = server
         .create_account(&CreateAccount {
             invite: String::new(),
+            sso_ticket: None,
             vault: to_wire(&header),
             auth_key: b64::encode(*login_key),
             device: NewDevice {
@@ -553,6 +561,7 @@ impl Member {
         let admitted = joining
             .enrol(&EnrolDevice {
                 enrolment: enrolment.token,
+                sso_ticket: None,
                 auth_key: b64::encode(*login_key),
                 device: NewDevice {
                     name: device.into(),

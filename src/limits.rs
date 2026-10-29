@@ -88,6 +88,24 @@ pub const PAIR: Bucket = Bucket {
     when_full: WhenFull::Coarsen,
 };
 
+/// Signing in with UwUAuth: two requests a login, and a person who gives up
+/// in the browser starts again. The second one costs a request to UwUAuth.
+pub const SSO: Bucket = Bucket {
+    name: "sso",
+    max: 30,
+    window: Duration::from_secs(10 * 60),
+    when_full: WhenFull::Coarsen,
+};
+
+/// SCIM requests with a token that is not the one: counted only when
+/// refused, so UwUAuth pushing a whole directory is never slowed down.
+pub const SCIM_REFUSED: Bucket = Bucket {
+    name: "scim-refused",
+    max: 10,
+    window: Duration::from_secs(10 * 60),
+    when_full: WhenFull::Coarsen,
+};
+
 // ── Per account, or per device ──────────────────────────────────────────────
 //
 // These are never refused for want of room, so what they do when full does
@@ -402,6 +420,28 @@ impl RateLimiter {
         tries.said = false;
         tries.at.push_back(now);
         Ok(())
+    }
+
+    /// Whether an address has used up a bucket, without counting this as a
+    /// try: for a bucket that counts only failures, asked before trying.
+    pub fn exhausted(&self, who: &str, bucket: &Bucket) -> bool {
+        let now = Instant::now();
+        let inner = self.inner.lock();
+        let Some(table) = inner.addresses.get(bucket.name) else {
+            return false;
+        };
+        let key = (who.to_string(), bucket.name);
+        let network = (network(who), bucket.name);
+        [key, network].iter().any(|key| {
+            table.tries.get(key).is_some_and(|tries| {
+                tries
+                    .at
+                    .iter()
+                    .filter(|at| now.duration_since(**at) < bucket.window)
+                    .count()
+                    >= bucket.max
+            })
+        })
     }
 
     /// A successful attempt need not count against the next one: the limit is

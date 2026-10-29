@@ -48,6 +48,10 @@ for another account: `docker compose exec uwusync uwusync-server invite` in
 [docs/deployment.md](docs/deployment.md) has the whole way: by hand, behind a
 reverse proxy, backups and restoring them, moving to another machine.
 
+Instead of invites, people can sign in with [UwUAuth](https://github.com/MinifyX/UwUAuth-Server)
+once the server is paired with it: `uwusync-server uwuauth pair <address> <code>`. The master
+password still opens the vault; see [docs/sso.md](docs/sso.md).
+
 Without Docker: `cargo build --release`, then run `uwusync-server`. It needs a
 folder (`UWUSYNC_DATA`, `./data` by default) and nothing else.
 
@@ -146,6 +150,7 @@ be told its password was wrong, and would go looking in the wrong place.
 | `UWUSYNC_MAX_TEAM_MEMBERS` | `50`              | Members of one team; a team may hold what one account may         |
 | `UWUSYNC_MAX_CONNECTIONS` | `512`              | Connections open at once, from everybody                          |
 | `UWUSYNC_MAX_CONNECTIONS_PER_IP` | `32`       | …and from one address (an IPv6 /64); `0` for no limit. Not applied behind a proxy |
+| `UWUSYNC_UWUAUTH_CA`     | –                  | A PEM file of extra roots to trust for UwUAuth ([sso.md](docs/sso.md)) |
 
 With Docker these come from `.env` next to `compose.yaml`, which install.sh
 writes; `UWUSYNC_BIND` there says where the container is published and
@@ -163,6 +168,9 @@ uwusync-server revoke <id>      shut a device out
 uwusync-server teams            the teams on this server: members, records, since when
 uwusync-server team-delete <id> delete a team with everything in it
 uwusync-server team-owner <team> <account>   make a member an owner, for a team without one
+uwusync-server uwuauth pair <address> <code>  pair with UwUAuth: sign in there instead of an invite
+uwusync-server uwuauth status   what it is paired with
+uwusync-server uwuauth unpair   stop signing in with UwUAuth; accounts stay
 uwusync-server backup           a consistent copy, right now
 uwusync-server restore [name]   list the backups, or put one back (server stopped)
 uwusync-server health           the container's health check
@@ -195,7 +203,7 @@ the same crate the client uses, so a schema change is one edit in one place.
 
 | Endpoint                                     | What it is for                                        |
 | -------------------------------------------- | ----------------------------------------------------- |
-| `POST /v1/accounts`                          | Create an account from an invite                      |
+| `POST /v1/accounts`                          | Create an account from an invite, or after signing in with UwUAuth |
 | `POST /v1/session/challenge`, `POST /v1/session` | A device signs a challenge and gets a token        |
 | `GET /v1/vault`, `POST /v1/vault/params`     | The vault header; the parameters a joining device needs |
 | `PUT /v1/vault/key`                          | A new master password: rewrap, no record touched      |
@@ -204,6 +212,9 @@ the same crate the client uses, so a schema change is one edit in one place.
 | `/v1/teams/…`                                | Teams: shared vaults, their members, invites, keys and records — [docs/teams.md](docs/teams.md) |
 | `GET /v1/devices`, `POST /v1/devices/invite`, `POST /v1/devices/enrol`, `POST /v1/devices/{id}/revoke` | Devices: list, let one in, shut one out — another one only with the master password |
 | `POST /v1/pair`, `GET`/`POST`/`DELETE /v1/pair/{id}` | The post box two devices pair through           |
+| `POST /v1/sso/authorize`, `POST /v1/sso/token` | Signing in with UwUAuth: where the browser goes, and a ticket for what came back — [docs/sso.md](docs/sso.md) |
+| `/scim/v2/…`                                 | UwUAuth pushes who may sign in (SCIM 2.0, bearer token from pairing) |
+| `GET /uwu/v1/server`, `GET /.well-known/uwusuite` | What this server is, for the suite                |
 | `GET /healthz`                               | Alive, and what schema it speaks                      |
 
 Limits it enforces without a key: 500 records or 8 MiB per request and per

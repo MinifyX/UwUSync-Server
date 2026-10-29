@@ -9,6 +9,7 @@ pub mod accounts;
 pub mod devices;
 pub mod invites;
 pub mod records;
+pub mod sso;
 pub mod teams;
 
 use parking_lot::{Mutex, MutexGuard};
@@ -246,7 +247,7 @@ fn carry_numbers_forward(database: &Path, replaced: Option<&Path>) -> rusqlite::
     Ok(())
 }
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -445,6 +446,48 @@ CREATE TABLE team_cursors (
 );
 "#;
 
+/// Signing in with UwUAuth (`docs/sso.md`): the pairing — one row at most —
+/// and the people UwUAuth has told this server about, over SCIM or by signing
+/// in, each with the account they made here once they made one.
+const V5: &str = r#"
+CREATE TABLE uwuauth (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    -- UwUAuth's own address, and its issuer.
+    url             TEXT    NOT NULL,
+    issuer          TEXT    NOT NULL,
+    client_id       TEXT    NOT NULL,
+    -- The OpenID Connect client secret. In the clear: the server has to send
+    -- it, and it opens nothing but signing in through UwUAuth, which still
+    -- needs the master password behind it.
+    client_secret   TEXT    NOT NULL,
+    -- SHA-256 of the token UwUAuth pushes people with; none without SCIM.
+    scim_token_hash BLOB,
+    app_id          TEXT,
+    manage_url      TEXT,
+    paired_ms       INTEGER NOT NULL
+);
+
+CREATE TABLE sso_users (
+    -- The id this server hands UwUAuth over SCIM.
+    id              TEXT    PRIMARY KEY,
+    -- Whose people they are, and who they are there: the ID token's `sub`,
+    -- which is SCIM's `externalId`.
+    issuer          TEXT    NOT NULL,
+    subject         TEXT    NOT NULL,
+    user_name       TEXT    NOT NULL,
+    display_name    TEXT,
+    -- 0 once UwUAuth says so: no sign-in, no device. The vault stays.
+    active          INTEGER NOT NULL DEFAULT 1,
+    -- The account they made here; none until they do.
+    account_id      TEXT    UNIQUE REFERENCES accounts (id),
+    created_ms      INTEGER NOT NULL,
+    updated_ms      INTEGER NOT NULL,
+    UNIQUE (issuer, subject)
+);
+
+CREATE INDEX sso_users_by_name ON sso_users (issuer, user_name COLLATE NOCASE);
+"#;
+
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -491,6 +534,13 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.commit()?;
         tracing::info!("database migrated to schema 4");
     }
+    if version < 5 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(V5)?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+        tracing::info!("database migrated to schema 5");
+    }
     Ok(())
 }
 
@@ -526,7 +576,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 11);
+        assert_eq!(tables, 13);
     }
 
     /// A database as 0.2 left it — schema 3, with an account and a record —

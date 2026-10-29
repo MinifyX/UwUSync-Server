@@ -120,6 +120,23 @@ sudo docker compose exec uwusync uwusync-server revoke <device>
 A revoked device stops syncing at once. What it already has, it keeps: rotate
 the keys and passwords it held.
 
+### Signing in with UwUAuth
+
+Paired with [UwUAuth](https://github.com/MinifyX/UwUAuth-Server), the server lets people make an
+account and add devices by signing in there, instead of with an invite. The master password still
+opens the vault; UwUAuth never sees or resets it. Make a pairing code in UwUAuth, then:
+
+```bash
+sudo docker compose exec uwusync uwusync-server uwuauth pair https://auth.example.com <code>
+sudo docker compose exec uwusync uwusync-server uwuauth status
+```
+
+It needs `UWUSYNC_PUBLIC` at an https address with a certificate UwUAuth trusts, so in practice
+[a reverse proxy](#behind-a-reverse-proxy) in front. For a UwUAuth behind a private CA, mount its
+root certificate into the container and point `UWUSYNC_UWUAUTH_CA` at it. UwUAuth then pushes who
+may sign in over SCIM; deactivating somebody there shuts their devices out here. The details are
+in [sso.md](sso.md).
+
 ### Teams
 
 A team is a vault that several accounts on this server share: its members
