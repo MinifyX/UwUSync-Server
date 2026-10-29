@@ -3058,6 +3058,8 @@ mod sso {
     pub(super) struct Provider {
         pub(super) issuer: String,
         codes: Arc<Mutex<Codes>>,
+        /// What the ID tokens say of the address: vouched for, or not.
+        email_verified: std::sync::atomic::AtomicBool,
     }
 
     fn signing_key() -> EcdsaKeyPair {
@@ -3205,11 +3207,20 @@ mod sso {
             tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            Provider { issuer, codes }
+            Provider {
+                issuer,
+                codes,
+                email_verified: true.into(),
+            }
         }
 
         /// Pair `server` with this provider, straight in its database.
         pub(super) fn pair(&self, server: &Server) {
+            self.pair_at(server, 1);
+        }
+
+        /// Pair anew, as `uwusync uwuauth pair` would while the server runs.
+        pub(super) fn pair_at(&self, server: &Server, paired_ms: u64) {
             people::set_pairing(
                 &server.state.db.lock(),
                 &Pairing {
@@ -3220,7 +3231,7 @@ mod sso {
                     scim_token_hash: Some(uwusync_server::sha256(SCIM_TOKEN.as_bytes()).to_vec()),
                     app_id: Some("app-1".into()),
                     manage_url: None,
-                    paired_ms: 1,
+                    paired_ms,
                 },
             )
             .unwrap();
@@ -3242,6 +3253,7 @@ mod sso {
             let now = uwusync_server::now_ms() / 1000;
             let claims = json!({
                 "iss": self.issuer, "aud": CLIENT_ID, "sub": sub, "email": email,
+                "email_verified": self.email_verified.load(std::sync::atomic::Ordering::SeqCst),
                 "name": "Mia Example", "nonce": query["nonce"],
                 "iat": now, "exp": now + 300,
             });
@@ -3473,6 +3485,13 @@ mod sso {
         let made = create_with(&server, other["ticket"].as_str().unwrap(), 6).await;
         assert_eq!(made.0, 200);
         assert_ne!(made.1["accountId"], device.account.to_string());
+
+        // An address UwUAuth does not vouch for names nobody: the `sub` does.
+        provider
+            .email_verified
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let unverified = ticket(&server, &provider, "person-3").await;
+        assert_eq!(unverified["userName"], "person-3");
     }
 
     #[tokio::test]
@@ -3522,7 +3541,16 @@ mod sso {
         )
         .await;
         assert_eq!(stolen.0, 401);
-        // And the state is gone with that: it is answered once.
+        // That does not use up the device's login: the right verifier still
+        // finishes it…
+        let own = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier }),
+        )
+        .await;
+        assert_eq!(own.0, 200, "{own:?}");
+        // …once: the state is gone with that.
         let late = post_json(
             &server,
             "/v1/sso/token",
@@ -3551,6 +3579,33 @@ mod sso {
 
         // A made-up ticket is no invite.
         assert_eq!(create_with(&server, "made-up", 1).await.0, 401);
+        // Paired anew while the server runs — from the command line, which
+        // the running server is not told about: tickets and logins from
+        // before are worth nothing.
+        let old = ticket(&server, &provider, "p").await;
+        let started = post_json(
+            &server,
+            "/v1/sso/authorize",
+            json!({ "redirectUri": REDIRECT, "codeChallenge": s256(&verifier) }),
+        )
+        .await;
+        let (code, state) =
+            provider.signs_in(started.1["url"].as_str().unwrap(), "p", "p@example.com");
+        provider.pair_at(&server, 2);
+        assert_eq!(
+            create_with(&server, old["ticket"].as_str().unwrap(), 1)
+                .await
+                .0,
+            401
+        );
+        let pending = post_json(
+            &server,
+            "/v1/sso/token",
+            json!({ "state": state, "code": code, "codeVerifier": verifier }),
+        )
+        .await;
+        assert_eq!(pending.0, 401);
+
         // And unpaired, a ticket from before is worth nothing.
         let ticket = ticket(&server, &provider, "p").await;
         people::unpair(&server.state.db.lock()).unwrap();
@@ -3692,6 +3747,18 @@ mod sso {
         }
         assert_eq!(statuses[0], 401);
         assert_eq!(*statuses.last().unwrap(), 429);
+        // UwUAuth itself, from the same address, is never slowed down.
+        for _ in 0..3 {
+            let pushed = scim(
+                &server,
+                reqwest::Method::GET,
+                "/scim/v2/Users",
+                SCIM_TOKEN,
+                None,
+            )
+            .await;
+            assert_eq!(pushed.0, 200, "{pushed:?}");
+        }
     }
 
     #[tokio::test]
@@ -3705,15 +3772,21 @@ mod sso {
         let id = pushed["id"].as_str().unwrap().to_string();
         assert_eq!(pushed["externalId"], "person-1");
         assert_eq!(pushed["active"], true);
-        let duplicate = scim(
+        // Pushed again: the same person, updated, with the same id.
+        let again = scim(
             &server,
             reqwest::Method::POST,
             "/scim/v2/Users",
             SCIM_TOKEN,
-            Some(json!({ "userName": "other@example.com", "externalId": "person-1" })),
+            Some(
+                json!({ "userName": "person-1@example.com", "externalId": "person-1",
+                         "displayName": "Mia E." }),
+            ),
         )
         .await;
-        assert_eq!(duplicate.0, 409);
+        assert_eq!(again.0, 200, "{again:?}");
+        assert_eq!(again.1["id"], id);
+        assert_eq!(again.1["displayName"], "Mia E.");
         let missing = scim(
             &server,
             reqwest::Method::POST,
@@ -3821,6 +3894,145 @@ mod sso {
         // Signing in again makes a new, empty account — not the old one.
         let fresh = super::sso::ticket(&server, &provider, "person-1").await;
         assert_eq!(fresh["hasAccount"], false);
+    }
+
+    #[tokio::test]
+    async fn a_person_who_signed_in_before_uwuauth_pushed_them_is_the_same_person() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+
+        // Signed in first, with an account and a device…
+        let first = ticket(&server, &provider, "person-1").await;
+        let created = create_with(&server, first["ticket"].as_str().unwrap(), 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        let mut device = device_of(&created.1, 1);
+        // …then UwUAuth pushes them: no conflict, the person they are.
+        let pushed = scim(
+            &server,
+            reqwest::Method::POST,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": "mia@example.com",
+                "externalId": "person-1",
+                "displayName": "Mia Example",
+                "active": true,
+            })),
+        )
+        .await;
+        assert!(matches!(pushed.0, 200 | 201), "{pushed:?}");
+        assert_eq!(pushed.1["userName"], "mia@example.com");
+        let id = pushed.1["id"].as_str().unwrap().to_string();
+        let all = scim(
+            &server,
+            reqwest::Method::GET,
+            "/scim/v2/Users",
+            SCIM_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(all.1["totalResults"], 1);
+        assert_eq!(all.1["Resources"][0]["id"], id);
+
+        // Turned off by that id: their device is out.
+        assert_eq!(patch_active(&server, &id, false).await.0, 200);
+        let pull = server
+            .client
+            .get(server.url("/v1/records?since=0"))
+            .bearer_auth(&device.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), 401);
+        assert_ne!(device.login(&server).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_spent_only_once_the_account_is_made() {
+        let provider = Provider::start().await;
+        let server = start(Registration::Invite).await;
+        provider.pair(&server);
+        let first = ticket(&server, &provider, "person-1").await;
+        let ticket_text = first["ticket"].as_str().unwrap();
+
+        // Making the account fails halfway: nothing is kept, and the ticket
+        // is still good.
+        server
+            .state
+            .db
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER no_devices BEFORE INSERT ON devices
+                 BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;",
+            )
+            .unwrap();
+        let failed = create_with(&server, ticket_text, 1).await;
+        assert_eq!(failed.0, 500, "{failed:?}");
+        assert_eq!(
+            uwusync_server::db::accounts::count(&server.state.db.lock()).unwrap(),
+            0
+        );
+        server
+            .state
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER no_devices;")
+            .unwrap();
+        let created = create_with(&server, ticket_text, 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+        assert_eq!(create_with(&server, ticket_text, 2).await.0, 401);
+    }
+
+    #[tokio::test]
+    async fn joining_with_uwuauth_is_limited_per_account() {
+        let provider = Provider::start().await;
+        let server = start_with(Config {
+            registration: Registration::Invite,
+            trust_forwarded: true,
+            ..Config::default()
+        })
+        .await;
+        provider.pair(&server);
+        let first = ticket(&server, &provider, "person-1").await;
+        let created = create_with(&server, first["ticket"].as_str().unwrap(), 1).await;
+        assert_eq!(created.0, 200, "{created:?}");
+
+        // From a new address every time, so only the count per account
+        // stands in the way.
+        let mut tries = 0u8;
+        let mut join = |ticket: String, password: &'static str| {
+            tries += 1;
+            let address = format!("198.51.100.{tries}");
+            let signing = Device::new_key(10 + tries);
+            let request = server
+                .client
+                .post(server.url("/v1/devices/enrol"))
+                .header("x-forwarded-for", address)
+                .json(&json!({
+                    "ssoTicket": ticket,
+                    "authKey": login_key(password),
+                    "device": {
+                        "name": "joining",
+                        "publicKey": uwusync_server::b64::encode(signing.verifying_key().to_bytes()),
+                    },
+                }));
+            async move { request.send().await.unwrap().status().as_u16() }
+        };
+        let max = uwusync_server::limits::SSO_JOINS.max;
+        let mut ticket_text = String::new();
+        for at in 0..max {
+            if at % (uwusync_server::sso::TICKET_TRIES as usize - 1) == 0 {
+                let fresh = ticket(&server, &provider, "person-1").await;
+                ticket_text = fresh["ticket"].as_str().unwrap().to_string();
+            }
+            assert_eq!(join(ticket_text.clone(), "wrong").await, 401);
+        }
+        // The right password, a fresh ticket: still too many for one account.
+        let fresh = ticket(&server, &provider, "person-1").await;
+        let fresh = fresh["ticket"].as_str().unwrap().to_string();
+        assert_eq!(join(fresh, "master").await, 429);
     }
 
     #[tokio::test]

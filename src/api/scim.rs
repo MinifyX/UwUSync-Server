@@ -163,10 +163,6 @@ pub struct Scim {
 }
 
 fn authenticate(state: &AppState, headers: &HeaderMap, peer: Peer) -> ScimResult<Scim> {
-    let who = who(state, headers, peer);
-    if state.limits.exhausted(&who, &limits::SCIM_REFUSED) {
-        return Err(ApiError::RateLimited.into());
-    }
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -188,6 +184,12 @@ fn authenticate(state: &AppState, headers: &HeaderMap, peer: Peer) -> ScimResult
         }
     }
     drop(conn);
+    // Only refusals count, and only they are refused once too many came:
+    // the right token is let in however many wrong ones were tried before.
+    let who = who(state, headers, peer);
+    if state.limits.exhausted(&who, &limits::SCIM_REFUSED) {
+        return Err(ApiError::RateLimited.into());
+    }
     state.limits.check(&who, &limits::SCIM_REFUSED)?;
     Err(ScimError::new(StatusCode::UNAUTHORIZED, "not allowed"))
 }
@@ -429,11 +431,19 @@ async fn create_user(
     let active = user.get("active").map(boolean).transpose()?.unwrap_or(true);
 
     let conn = state.db.lock();
-    if people::by_subject(&conn, &scim.issuer, &subject)?.is_some() {
-        return Err(ScimError::conflict(
-            "uniqueness",
-            "a user with this externalId exists",
-        ));
+    if let Some(known) = people::by_subject(&conn, &scim.issuer, &subject)? {
+        // Already here: they signed in before UwUAuth pushed them, or the
+        // push is repeated. Either way it is the same person, so the push
+        // updates them and answers with the id they already have.
+        drop(conn);
+        tracing::info!(person = %known.id, "UwUAuth pushed a person already known here");
+        let change = Change {
+            user_name: Some(user_name),
+            subject: None,
+            display_name: Some(display_name),
+            active: Some(active),
+        };
+        return apply(&state, &scim, &known.id.to_string(), change);
     }
     let created = people::insert(
         &conn,
@@ -656,8 +666,7 @@ async fn delete_user(
              make someone else owner first",
         ));
     }
-    let (devices, left) = people::delete_account(&mut conn, account)?;
-    people::delete(&conn, user.id)?;
+    let (devices, left) = people::delete_account(&mut conn, user.id, account)?;
     let mut told = Vec::new();
     for team in &left.teams {
         told.push((

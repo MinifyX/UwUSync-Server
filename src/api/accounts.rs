@@ -67,18 +67,20 @@ pub async fn create(
                     "this person has an account here already: join it instead".into(),
                 ));
             }
-            if state.sso.spend(ticket, now) != Some(person.id) {
-                return Err(ApiError::Unauthorized);
-            }
-            Some(person)
+            // Spent once the account is there, below: a create that fails
+            // leaves the sign-in to try again with.
+            Some((person, ticket, now))
         }
         None => None,
     };
+    // All of it or none of it: the invite, the account, its first device and
+    // the link to the person.
+    let tx = conn.unchecked_transaction()?;
     match state.config.registration {
         _ if person.is_some() => {}
         Registration::Closed => return Err(ApiError::RegistrationClosed),
         Registration::Invite => {
-            if !invites::redeem_invite(&conn, &request.invite)? {
+            if !invites::redeem_invite(&tx, &request.invite)? {
                 // An invite that is used, expired or made up: all the same
                 // answer, so the code cannot be probed for.
                 return Err(ApiError::Unauthorized);
@@ -87,11 +89,16 @@ pub async fn create(
         Registration::Open => {}
     }
 
-    let account = accounts::create(&conn, &request.vault, &key)?;
-    let device = devices::add(&conn, account.id, &request.device.name, &device_key)?;
-    if let Some(person) = &person {
-        crate::db::sso::link(&conn, person.id, account.id)?;
+    let account = accounts::create(&tx, &request.vault, &key)?;
+    let device = devices::add(&tx, account.id, &request.device.name, &device_key)?;
+    if let Some((person, ticket, now)) = &person {
+        crate::db::sso::link(&tx, person.id, account.id)?;
+        if state.sso.spend(ticket, *now) != Some(person.id) {
+            // Ran out, or UwUAuth turned them away meanwhile: nothing made.
+            return Err(ApiError::Unauthorized);
+        }
     }
+    tx.commit()?;
     drop(conn);
 
     let (token, expires_ms) =

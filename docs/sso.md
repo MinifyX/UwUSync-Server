@@ -38,7 +38,9 @@ sudo docker compose exec uwusync uwusync-server uwuauth unpair   # forget the cl
 
 Unpairing stops signing in with UwUAuth and makes every ticket handed out before useless. Accounts
 made that way stay, and the devices that have them keep syncing. Remove the app in UwUAuth as well.
-Pairing again, with the same or another UwUAuth, replaces the old pairing.
+Pairing again, with the same or another UwUAuth, replaces the old pairing. Logins in progress and
+tickets are bound to the pairing they were made under (its client id and when it was made), so a
+running server refuses them on the next request after `pair` or `unpair`, without a restart.
 
 ### What pairing needs
 
@@ -75,12 +77,15 @@ device                          UwUSync server                      UwUAuth
 - **Two PKCE pairs.** The device's, between it and this server: only the device that started a
   login can finish it. And the server's own towards UwUAuth, as any confidential client.
 - `state` is checked by the device against what it got, and by the server, which answers each state
-  once and forgets it after ten minutes. A callback that names an issuer (RFC 9207) has to name
+  once and forgets it after ten minutes. The device's PKCE verifier is checked before the state is
+  used up: somebody who saw the state but not the verifier cannot spend the device's login. A callback that names an issuer (RFC 9207) has to name
   the paired one.
 - The ID token is checked by the server: signature against UwUAuth's keys (fetched again once when
   a key is unknown), issuer, audience, expiry and the nonce.
 - What the device gets is a **ticket**: for five minutes and one use, "this is UwUAuth's person
   so-and-so", plus whether they have an account here already and whether it needs the account key.
+- The person's `userName` here is the ID token's `email` only when `email_verified` is true;
+  otherwise `preferred_username`, then `sub`. It is a label: who somebody is stays issuer and `sub`.
 
 With the ticket the device either
 
@@ -90,6 +95,12 @@ With the ticket the device either
   password, and the account key if the vault has one, exactly as with an enrolment token.
 
 A ticket survives five wrong master passwords, then it is gone and the person signs in again.
+It is used up only once the account is made or the device is in: a create that fails leaves it
+good for another try. Joins with a ticket are also counted per account: ten an hour, wrong master
+passwords included, so somebody who took over a person's UwUAuth login gets a handful of guesses
+an hour however many tickets they fetch. Each join with a ticket is logged with the account,
+device and person ("a device joined with a UwUAuth sign-in"). Telling the account's other devices
+about such a join is not done yet; it is planned.
 Logins in progress and tickets live in memory only; a restart costs a person one more sign-in and
 nothing else.
 
@@ -106,7 +117,7 @@ When UwUAuth handed out a SCIM token, it pushes who may sign in to `<UWUSYNC_PUB
 | --- | --- |
 | `GET /scim/v2/ServiceProviderConfig`, `/ResourceTypes` | what this endpoint can do: patch, filter, no bulk, no sort, no ETags |
 | `GET /scim/v2/Users` | the people, paged (`startIndex`, `count` up to 200), filter `userName eq "…"` or `externalId eq "…"` only |
-| `POST /scim/v2/Users` | a new person; `externalId` (UwUAuth's `sub`) is required, 409 when it is taken |
+| `POST /scim/v2/Users` | a new person; `externalId` (UwUAuth's `sub`) is required. A person already known by that `externalId` (signed in before being pushed, or pushed twice) is updated and answered with 200 and their existing id |
 | `GET`, `PUT`, `PATCH`, `DELETE /scim/v2/Users/{id}` | one person |
 | `/scim/v2/Groups` | accepted and ignored: this server has no groups |
 
@@ -126,8 +137,9 @@ When UwUAuth handed out a SCIM token, it pushes who may sign in to `<UWUSYNC_PUB
   member an owner or admin in the app first, or deactivate the person instead. A team only they are
   in goes with them.
 
-The bearer token is compared in constant time against the stored hash. Ten refused requests from
-one address in ten minutes get 429 until the window passes; accepted requests are not counted.
+The bearer token is checked first, in constant time against the stored hash; the right token is
+always let in. Only refused requests are counted: ten from one address in ten minutes, and further
+wrong tokens from there get 429 until the window passes.
 Bodies are capped, texts are at most 256 characters without control characters, a PATCH has at
 most 64 operations.
 

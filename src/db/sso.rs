@@ -22,6 +22,16 @@ pub struct Pairing {
     pub paired_ms: u64,
 }
 
+impl Pairing {
+    /// Which pairing this is: a new pairing, even with the same client, is
+    /// another one. Logins and tickets are bound to it, so whatever the
+    /// command line does to the pairing, a running server notices on the
+    /// next request.
+    pub fn generation(&self) -> String {
+        format!("{}\n{}", self.client_id, self.paired_ms)
+    }
+}
+
 pub fn pairing(conn: &Connection) -> rusqlite::Result<Option<Pairing>> {
     conn.query_row(
         "SELECT url, issuer, client_id, client_secret, scim_token_hash, app_id, manage_url,
@@ -315,18 +325,20 @@ pub fn teams_only_owned_by(conn: &Connection, account: Uuid) -> rusqlite::Result
         .collect())
 }
 
-/// Delete an account with everything it holds: its records, its devices, its
-/// place in every team, and the person's link to it. The caller has checked
+/// Delete a person together with their account and everything it holds: its
+/// records, its devices, its place in every team. All of it in one
+/// transaction, so nothing is left half gone. The caller has checked
 /// [`teams_only_owned_by`] first. Hands back the devices it had, and what
 /// became of its teams.
 pub fn delete_account(
     conn: &mut Connection,
+    person: Uuid,
     account: Uuid,
 ) -> crate::Result<(Vec<Uuid>, crate::db::teams::Left)> {
+    let tx = conn.transaction()?;
     // Memberships, invites made, team cursors of its devices, the identity —
     // and a team it was the last member of.
-    let left = crate::db::teams::forget_account(conn, account)?;
-    let tx = conn.transaction()?;
+    let left = crate::db::teams::forget_account_in(&tx, account)?;
     let id = account.to_string();
     let devices: Vec<Uuid> = {
         let mut stmt = tx.prepare("SELECT id FROM devices WHERE account_id = ?1")?;
@@ -349,6 +361,7 @@ pub fn delete_account(
     )?;
     tx.execute("DELETE FROM devices WHERE account_id = ?1", [&id])?;
     tx.execute("DELETE FROM accounts WHERE id = ?1", [&id])?;
+    tx.execute("DELETE FROM sso_users WHERE id = ?1", [person.to_string()])?;
     tx.commit()?;
     Ok((devices, left))
 }

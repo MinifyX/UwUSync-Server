@@ -45,10 +45,11 @@ pub struct Pending {
     /// This server's own PKCE verifier towards UwUAuth.
     pub verifier: String,
     pub nonce: String,
-    /// The pairing it was started with: a login that outlives a new pairing
-    /// is not finished against the new one.
+    /// The pairing it was started with (see
+    /// [`crate::db::sso::Pairing::generation`]): a login that outlives a new
+    /// pairing is not finished against the new one.
     pub issuer: String,
-    pub client_id: String,
+    pub generation: String,
     pub expires_ms: u64,
 }
 
@@ -56,6 +57,10 @@ pub struct Pending {
 #[derive(Debug, Clone)]
 struct Ticket {
     person: Uuid,
+    /// The pairing it was handed out under: it is worth nothing under any
+    /// other, which is how unpairing or pairing anew from the command line
+    /// reaches a server that is running.
+    generation: String,
     expires_ms: u64,
     failures: u32,
 }
@@ -98,15 +103,33 @@ impl SsoStore {
     /// The login under `state`, taken out: whatever happens next, a state is
     /// answered once.
     pub fn take(&self, state: &str, now: u64) -> Option<Pending> {
+        self.take_if(state, now, |_| true)
+    }
+
+    /// The login of `state`, taken out only when `proof` holds for it: a
+    /// request that cannot show the device's PKCE verifier does not use up
+    /// the login of the device that can.
+    pub fn take_if(
+        &self,
+        state: &str,
+        now: u64,
+        proof: impl FnOnce(&Pending) -> bool,
+    ) -> Option<Pending> {
         let mut inner = self.inner.lock();
-        inner
-            .logins
-            .remove(&key(state))
-            .filter(|login| login.expires_ms > now)
+        let hashed = key(state);
+        let login = inner.logins.get(&hashed)?;
+        if login.expires_ms <= now {
+            inner.logins.remove(&hashed);
+            return None;
+        }
+        if !proof(login) {
+            return None;
+        }
+        inner.logins.remove(&hashed)
     }
 
     /// A ticket for `person`, and when it runs out.
-    pub fn issue(&self, person: Uuid, now: u64) -> (String, u64) {
+    pub fn issue(&self, person: Uuid, generation: &str, now: u64) -> (String, u64) {
         let ticket = crate::b64::encode(crate::random_bytes::<32>());
         let expires_ms = now + TICKET_TTL_MS;
         let mut inner = self.inner.lock();
@@ -125,6 +148,7 @@ impl SsoStore {
             key(&ticket),
             Ticket {
                 person,
+                generation: generation.to_string(),
                 expires_ms,
                 failures: 0,
             },
@@ -133,16 +157,19 @@ impl SsoStore {
     }
 
     /// Whose ticket this is, without using it up.
-    pub fn peek(&self, ticket: &str, now: u64) -> Option<Uuid> {
+    pub fn peek(&self, ticket: &str, generation: &str, now: u64) -> Option<Uuid> {
         if ticket.is_empty() || ticket.len() > 128 {
             return None;
         }
-        let inner = self.inner.lock();
-        inner
-            .tickets
-            .get(&key(ticket))
-            .filter(|found| found.expires_ms > now)
-            .map(|found| found.person)
+        let mut inner = self.inner.lock();
+        let hashed = key(ticket);
+        let found = inner.tickets.get(&hashed)?;
+        if found.expires_ms <= now || found.generation != generation {
+            // Ran out, or the pairing it came from is gone: of no more use.
+            inner.tickets.remove(&hashed);
+            return None;
+        }
+        Some(found.person)
     }
 
     /// Use a ticket up. Whose it was, if it was still there.
@@ -231,7 +258,7 @@ mod tests {
             verifier: "v".repeat(43),
             nonce: "n".into(),
             issuer: "https://auth.example.com".into(),
-            client_id: "sync".into(),
+            generation: "sync\n1".into(),
             expires_ms,
         }
     }
@@ -245,29 +272,48 @@ mod tests {
         assert!(store.take(&state, 0).is_none(), "once");
         let late = store.begin(pending(1_000), 0);
         assert!(store.take(&late, 1_000).is_none(), "in time");
+
+        let state = store.begin(pending(1_000), 0);
+        assert!(store.take_if(&state, 0, |_| false).is_none());
+        assert!(
+            store.take_if(&state, 0, |_| true).is_some(),
+            "a failed proof leaves the login to the device"
+        );
+    }
+
+    #[test]
+    fn a_ticket_is_only_good_under_the_pairing_it_came_from() {
+        let store = SsoStore::default();
+        let person = Uuid::now_v7();
+        let (ticket, _) = store.issue(person, "g1", 0);
+        assert_eq!(store.peek(&ticket, "g2", 0), None);
+        assert_eq!(store.peek(&ticket, "g1", 0), None, "and is gone after");
     }
 
     #[test]
     fn a_ticket_is_one_use_and_a_few_wrong_passwords() {
         let store = SsoStore::default();
         let person = Uuid::now_v7();
-        let (ticket, expires) = store.issue(person, 0);
+        let (ticket, expires) = store.issue(person, "g1", 0);
         assert_eq!(expires, TICKET_TTL_MS);
-        assert_eq!(store.peek(&ticket, 0), Some(person));
+        assert_eq!(store.peek(&ticket, "g1", 0), Some(person));
         for _ in 1..TICKET_TRIES {
             assert!(!store.failed(&ticket));
         }
         assert!(store.failed(&ticket), "the last try uses it up");
-        assert_eq!(store.peek(&ticket, 0), None);
+        assert_eq!(store.peek(&ticket, "g1", 0), None);
 
-        let (ticket, _) = store.issue(person, 0);
-        assert_eq!(store.peek(&ticket, TICKET_TTL_MS), None, "ran out");
+        let (ticket, _) = store.issue(person, "g1", 0);
         assert_eq!(store.spend(&ticket, 1), Some(person));
         assert_eq!(store.spend(&ticket, 1), None);
 
-        let (ticket, _) = store.issue(person, 0);
+        let (ticket, _) = store.issue(person, "g1", 0);
+        assert_eq!(store.peek(&ticket, "g1", TICKET_TTL_MS), None, "ran out");
+        assert_eq!(store.spend(&ticket, 1), None);
+
+        let (ticket, _) = store.issue(person, "g1", 0);
         store.forget_person(person);
-        assert_eq!(store.peek(&ticket, 0), None);
+        assert_eq!(store.peek(&ticket, "g1", 0), None);
     }
 
     #[test]
@@ -278,7 +324,7 @@ mod tests {
         }
         assert_eq!(store.inner.lock().logins.len(), MAX_LOGINS);
         for _ in 0..(MAX_TICKETS + 10) {
-            store.issue(Uuid::now_v7(), 0);
+            store.issue(Uuid::now_v7(), "g1", 0);
         }
         assert_eq!(store.inner.lock().tickets.len(), MAX_TICKETS);
     }

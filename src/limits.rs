@@ -111,6 +111,17 @@ pub const SCIM_REFUSED: Bucket = Bucket {
 // These are never refused for want of room, so what they do when full does
 // not come up.
 
+/// Devices joining an account with a UwUAuth sign-in instead of an
+/// enrolment token, tries with a wrong master password included: whoever
+/// took over somebody's UwUAuth login gets a handful of guesses at their
+/// master password an hour, however many tickets they fetch.
+pub const SSO_JOINS: Bucket = Bucket {
+    name: "sso-joins",
+    max: 10,
+    window: Duration::from_secs(60 * 60),
+    when_full: WhenFull::Admit,
+};
+
 /// A device syncing hard pushes a few batches a pass; this is room for a
 /// dozen devices doing that at once.
 pub const PUSH: Bucket = Bucket {

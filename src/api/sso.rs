@@ -72,7 +72,7 @@ pub async fn authorize(
             verifier: verifier.clone(),
             nonce: nonce.clone(),
             issuer: pairing.issuer.clone(),
-            client_id: pairing.client_id.clone(),
+            generation: pairing.generation(),
             expires_ms,
         },
         now,
@@ -112,24 +112,25 @@ pub async fn token(
     let request: SsoFinish = super::body(&state, request).await?;
     let now = state.clock.now_ms();
 
-    // Taken out first: a state is answered once, whatever happens next.
+    // Taken out once the device's PKCE verifier matches, and then whatever
+    // happens next: a state is answered once. A wrong verifier leaves the
+    // login to the device that holds the right one.
+    let verified = |login: &store::Pending| {
+        store::pkce_shaped(&request.code_verifier)
+            && crate::db::constant_time_eq(
+                store::s256(&request.code_verifier).as_bytes(),
+                login.challenge.as_bytes(),
+            )
+    };
     let login = state
         .sso
-        .take(&request.state, now)
+        .take_if(&request.state, now, verified)
         .ok_or(ApiError::Unauthorized)?;
-    if !store::pkce_shaped(&request.code_verifier)
-        || !crate::db::constant_time_eq(
-            store::s256(&request.code_verifier).as_bytes(),
-            login.challenge.as_bytes(),
-        )
-    {
-        return Err(ApiError::Unauthorized);
-    }
     if request.code.is_empty() || request.code.len() > MAX_CODE {
         return Err(ApiError::Invalid("a code from UwUAuth".into()));
     }
     let pairing = pairing(&state)?;
-    if pairing.issuer != login.issuer || pairing.client_id != login.client_id {
+    if pairing.issuer != login.issuer || pairing.generation() != login.generation {
         // Paired anew while the browser was open.
         return Err(ApiError::Unauthorized);
     }
@@ -187,7 +188,7 @@ pub async fn token(
     })?;
 
     let person = person_for(&state, &pairing.issuer, &claims)?;
-    let (ticket, expires_ms) = state.sso.issue(person.id, now);
+    let (ticket, expires_ms) = state.sso.issue(person.id, &pairing.generation(), now);
     let needs_account_key = match person.account_id {
         Some(account) => accounts::header(&state.db.lock(), account)?
             .map(|header| header.needs_account_key)
@@ -221,7 +222,13 @@ fn person_for(
             .map(str::to_string)
     };
     let subject = text("sub").ok_or(ApiError::Unauthorized)?;
-    let user_name = text("email")
+    // An address only names someone once the issuer vouches for it.
+    let email = if claims.get("email_verified") == Some(&Value::Bool(true)) {
+        text("email")
+    } else {
+        None
+    };
+    let user_name = email
         .or_else(|| text("preferred_username"))
         .unwrap_or_else(|| subject.clone());
     let display_name = text("name");
@@ -304,9 +311,12 @@ pub fn ticket_person(
     ticket: &str,
     now: u64,
 ) -> Result<people::SsoUser> {
-    let id = state.sso.peek(ticket, now).ok_or(ApiError::Unauthorized)?;
-    let person = people::by_id(conn, id)?.ok_or(ApiError::Unauthorized)?;
     let paired = people::pairing(conn)?.ok_or(ApiError::SsoOff)?;
+    let id = state
+        .sso
+        .peek(ticket, &paired.generation(), now)
+        .ok_or(ApiError::Unauthorized)?;
+    let person = people::by_id(conn, id)?.ok_or(ApiError::Unauthorized)?;
     if person.issuer != paired.issuer {
         return Err(ApiError::Unauthorized);
     }

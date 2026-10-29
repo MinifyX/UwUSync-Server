@@ -20,7 +20,8 @@ before. How it works, and what an operator sets, is in [docs/sso.md](docs/sso.md
   state and nonce, and checks the ID token itself. What the device gets is a ticket for five
   minutes and one use, bound to the device's own PKCE pair, that stands in for the invite.
 - **SCIM.** UwUAuth pushes who may sign in to `/scim/v2/Users`. Somebody pushed and not yet signed
-  in is kept as pending. `active: false` shuts all their devices out at once and keeps their
+  in is kept as pending; pushing somebody who already signed in updates them and answers with
+  the id they have. `active: false` shuts all their devices out at once and keeps their
   data; `active: true` lets them back in with their master password. Deleting somebody deletes
   their account, unless they are the only owner of a team that has other members: that is
   refused with 409 until another member is an owner. Groups are taken and ignored.
