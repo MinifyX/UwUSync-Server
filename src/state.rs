@@ -177,39 +177,30 @@ impl Events {
 ///
 /// Behind a reverse proxy every request comes from the proxy, so the real
 /// address is in `X-Forwarded-For` — which anyone can set, so it is only
-/// believed when the server was told there is a proxy in front.
+/// believed when the server was told there is a proxy in front, and only on a
+/// request that comes from that proxy ([`Config::proxies`]). It is read from
+/// the right, past every hop that is a trusted proxy itself: a proxy that
+/// appends (nginx with `$proxy_add_x_forwarded_for`, most of them) keeps
+/// whatever the client wrote in front of it, so anything left of the first
+/// untrusted hop is the client's to choose — and a rate limit keyed on it is
+/// no limit at all. See [`crate::proxies`].
 ///
 /// Addresses are counted the way they can be had: IPv6 per /64, because one
 /// machine commonly has a whole /64 to itself and can take a fresh address
 /// from it for every request.
-///
-/// And a forwarded address is believed only as its **last** entry: that is the one the proxy added. A
-/// proxy that appends (nginx with `$proxy_add_x_forwarded_for`, most of them)
-/// keeps whatever the client wrote in front of it, so the first address is the
-/// client's to choose — and a rate limit keyed on it is no limit at all.
-/// Anything that is not an address falls back to the socket's.
 pub fn client_key(
     config: &Config,
     headers: &axum::http::HeaderMap,
     peer: Option<SocketAddr>,
 ) -> String {
-    if config.trust_forwarded {
-        // Every line of the header, in order: a proxy may add its own line
-        // instead of appending to the client's.
-        let last = headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .map(str::trim)
-            .rfind(|value| !value.is_empty())
-            .and_then(|value| value.parse::<std::net::IpAddr>().ok());
-        if let Some(address) = last {
-            return counted(address);
-        }
+    match peer {
+        Some(peer) => counted(crate::proxies::client_behind(
+            peer.ip(),
+            config.proxies(),
+            headers,
+        )),
+        None => "unknown".to_string(),
     }
-    peer.map(|peer| counted(peer.ip()))
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub(crate) fn counted(address: IpAddr) -> String {
@@ -241,7 +232,7 @@ mod tests {
         let config = Config::default();
         let peer = Some("10.0.0.5:4000".parse().unwrap());
         assert_eq!(
-            client_key(&config, &headers("1.2.3.4"), peer),
+            client_key(&config, &headers("203.0.113.4"), peer),
             "10.0.0.5",
             "anyone can send that header"
         );
@@ -250,18 +241,42 @@ mod tests {
             trust_forwarded: true,
             ..Config::default()
         };
-        assert_eq!(client_key(&trusting, &headers("1.2.3.4"), peer), "1.2.3.4");
         assert_eq!(
-            client_key(&trusting, &headers("6.6.6.6, 1.2.3.4"), peer),
-            "1.2.3.4",
+            client_key(&trusting, &headers("203.0.113.4"), peer),
+            "203.0.113.4"
+        );
+        assert_eq!(
+            client_key(&trusting, &headers("203.0.113.66, 203.0.113.4"), peer),
+            "203.0.113.4",
             "the last one is what the proxy saw; the first is whatever the client wrote"
         );
-        let mut two_lines = headers("6.6.6.6");
-        two_lines.append("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let mut two_lines = headers("203.0.113.66");
+        two_lines.append("x-forwarded-for", "203.0.113.4".parse().unwrap());
         assert_eq!(
             client_key(&trusting, &two_lines, peer),
-            "1.2.3.4",
+            "203.0.113.4",
             "a proxy that adds a line of its own"
+        );
+        let public_peer = Some("198.51.100.20:4000".parse().unwrap());
+        assert_eq!(
+            client_key(&trusting, &headers("203.0.113.4"), public_peer),
+            "198.51.100.20",
+            "not from a proxy: the header is the client's own word"
+        );
+        let named = Config {
+            trust_forwarded: true,
+            trusted_proxies: Some(crate::proxies::parse_list("198.51.100.20").unwrap()),
+            ..Config::default()
+        };
+        assert_eq!(
+            client_key(&named, &headers("203.0.113.4"), public_peer),
+            "203.0.113.4",
+            "a proxy named in the list"
+        );
+        assert_eq!(
+            client_key(&named, &headers("203.0.113.4"), peer),
+            "10.0.0.5",
+            "and with a list, only that one"
         );
         assert_eq!(
             client_key(&trusting, &headers("not-an-address"), peer),

@@ -27,6 +27,7 @@ pub mod limits;
 pub mod oidc;
 pub mod outbound;
 pub mod pairing;
+pub mod proxies;
 pub mod sso;
 pub mod state;
 pub mod tls;

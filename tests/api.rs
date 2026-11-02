@@ -1170,6 +1170,35 @@ async fn a_device_cannot_be_kept_from_signing_in_from_elsewhere() {
     );
 }
 
+#[tokio::test]
+async fn a_forwarded_address_counts_only_from_a_named_proxy() {
+    // Forwarding is on, but the proxy is somewhere else: the test client, on
+    // loopback, is not it, so what it writes into the header is not believed.
+    let server = start_with(Config {
+        registration: Registration::Open,
+        trust_forwarded: true,
+        trusted_proxies: Some(uwusync_server::proxies::parse_list("192.0.2.10").unwrap()),
+        ..Config::default()
+    })
+    .await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+    let mut refused = false;
+    for at in 0..=uwusync_server::limits::SESSION.max {
+        let response = server
+            .client
+            .post(server.url("/v1/session"))
+            .header("x-forwarded-for", format!("203.0.113.{}", at % 250 + 1))
+            .json(&json!({ "deviceId": device.id, "signature": uwusync_server::b64::encode([0u8; 64]) }))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 429 {
+            refused = true;
+        }
+    }
+    assert!(refused, "a fresh header every time is still one address");
+}
+
 // ── Pairing ──────────────────────────────────────────────────────────────────
 //
 // The server carries messages between two devices and understands none of
