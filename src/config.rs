@@ -4,8 +4,10 @@
 //! and a setting that lives in two places is a setting that disagrees with
 //! itself.
 
+use crate::proxies::{self, Cidr};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 /// Whether the server brings its own certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +116,9 @@ pub struct Config {
     /// Only ever true behind a proxy that sets it, or anyone can pretend to be
     /// someone else.
     pub trust_forwarded: bool,
+    /// Where that proxy is: only requests from these networks have their
+    /// `X-Forwarded-For` believed. None: loopback and the private networks.
+    pub trusted_proxies: Option<Vec<Cidr>>,
     /// How long a device's session token lives before it signs again.
     pub session_secs: u64,
     /// Ask GitHub once a day whether there is a newer release, and say so in
@@ -149,6 +154,7 @@ impl Default for Config {
             registration: Registration::Invite,
             tls: TlsMode::Auto,
             trust_forwarded: false,
+            trusted_proxies: None,
             session_secs: 60 * 60,
             update_check: true,
             channel: None,
@@ -163,6 +169,18 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The proxies whose `X-Forwarded-For` counts: none unless
+    /// `trust_forwarded`, then the list, or loopback and the private networks
+    /// without one.
+    pub fn proxies(&self) -> &[Cidr] {
+        static PRIVATE: LazyLock<Vec<Cidr>> = LazyLock::new(proxies::private_networks);
+        match (self.trust_forwarded, &self.trusted_proxies) {
+            (false, _) => &[],
+            (true, Some(list)) => list,
+            (true, None) => &PRIVATE,
+        }
+    }
+
     /// Read the environment. A variable that is set but unusable is an error
     /// rather than a default quietly taking over — a server that listens
     /// somewhere else than asked is worse than one that refuses to start.
@@ -190,6 +208,9 @@ impl Config {
         if let Some(trust) = var("UWUSYNC_TRUST_FORWARDED") {
             config.trust_forwarded = switch(&trust)
                 .ok_or_else(|| format!("UWUSYNC_TRUST_FORWARDED must be on or off: {trust}"))?;
+        }
+        if let Some(list) = var("UWUSYNC_TRUSTED_PROXIES") {
+            config.trusted_proxies = Some(trusted_proxies(config.trust_forwarded, &list)?);
         }
         if let Some(secs) = var("UWUSYNC_SESSION_SECS") {
             config.session_secs = secs
@@ -311,6 +332,20 @@ pub fn legacy_variables() -> Vec<String> {
     names
 }
 
+/// `UWUSYNC_TRUSTED_PROXIES`: a list that names at least one proxy, and only
+/// with forwarding on — a list that does nothing is a mistake to say out loud.
+fn trusted_proxies(trust_forwarded: bool, list: &str) -> Result<Vec<Cidr>, String> {
+    if !trust_forwarded {
+        return Err("UWUSYNC_TRUSTED_PROXIES is only read with UWUSYNC_TRUST_FORWARDED=on".into());
+    }
+    let networks =
+        proxies::parse_list(list).map_err(|error| format!("UWUSYNC_TRUSTED_PROXIES: {error}"))?;
+    if networks.is_empty() {
+        return Err("UWUSYNC_TRUSTED_PROXIES names no proxy".into());
+    }
+    Ok(networks)
+}
+
 fn number(name: &str, value: &str) -> Result<u64, String> {
     value
         .trim()
@@ -409,6 +444,55 @@ mod tests {
         assert_eq!(switch("on"), Some(true));
         assert_eq!(switch("0"), Some(false));
         assert_eq!(switch("later"), None);
+    }
+
+    #[test]
+    fn forwarded_addresses_count_from_the_proxies_named() {
+        assert!(
+            Config::default().proxies().is_empty(),
+            "the peer's address unless forwarding is on"
+        );
+        let on = Config {
+            trust_forwarded: true,
+            ..Config::default()
+        };
+        assert!(
+            on.proxies()
+                .iter()
+                .any(|net| net.contains("172.18.0.1".parse().unwrap())),
+            "a proxy in Docker next door"
+        );
+        assert!(
+            !on.proxies()
+                .iter()
+                .any(|net| net.contains("203.0.113.1".parse().unwrap())),
+            "nobody on the internet"
+        );
+        let named = Config {
+            trust_forwarded: true,
+            trusted_proxies: Some(trusted_proxies(true, "192.0.2.10, 2001:db8::/32").unwrap()),
+            ..Config::default()
+        };
+        assert_eq!(
+            named
+                .proxies()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.10/32", "2001:db8::/32"]
+        );
+        let ignored = Config {
+            trusted_proxies: named.trusted_proxies.clone(),
+            ..Config::default()
+        };
+        assert!(ignored.proxies().is_empty(), "a list alone believes nobody");
+
+        assert!(
+            trusted_proxies(false, "192.0.2.10").is_err(),
+            "only with forwarding on"
+        );
+        assert!(trusted_proxies(true, "192.0.2.10, proxy.example.com").is_err());
+        assert!(trusted_proxies(true, " , ").is_err());
     }
 
     #[test]

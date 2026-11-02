@@ -137,7 +137,8 @@ be told its password was wrong, and would go looking in the wrong place.
 | `UWUSYNC_PUBLIC`          | the listen address | How devices reach this server; goes into the setup code           |
 | `UWUSYNC_TLS`             | `auto`             | `auto` for its own certificate, `off` when a proxy does the TLS    |
 | `UWUSYNC_REGISTRATION`    | `invite`           | `open`, `invite` or `closed`                                      |
-| `UWUSYNC_TRUST_FORWARDED` | `off`              | Believe the last `X-Forwarded-For` address — only behind a proxy  |
+| `UWUSYNC_TRUST_FORWARDED` | `off`              | Believe the address the proxy added to `X-Forwarded-For` — only behind a proxy |
+| `UWUSYNC_TRUSTED_PROXIES` | loopback and private networks | With forwarding on: the proxies (`192.0.2.10, 198.51.100.0/24`) whose `X-Forwarded-For` counts |
 | `UWUSYNC_SESSION_SECS`    | `3600`             | How long a device's token lasts before it signs a challenge again |
 | `UWUSYNC_UPDATE_CHECK`    | `on`               | Ask GitHub once a day whether there is a newer release            |
 | `UWUSYNC_MAX_ACCOUNTS`    | `100`              | How many accounts the server takes, whoever asks                  |
@@ -260,8 +261,11 @@ end of its handshake holds the key in `tls/key.pem`.
 
 Already have a real certificate? `sudo bash install.sh --behind-proxy
 https://sync.example.com` sets `UWUSYNC_TLS=off`, listens on `127.0.0.1` only,
-and believes the last `X-Forwarded-For` address, which is the one your proxy
-adds — so the rate limits count devices, not the proxy. Caddy and nginx
+and believes the `X-Forwarded-For` address your proxy adds — so the rate
+limits count devices, not the proxy. It believes it only from the proxy
+itself: by default from loopback and the private networks, or from what
+`UWUSYNC_TRUSTED_PROXIES` in `.env` names (`192.0.2.10, 198.51.100.0/24`)
+when the proxy sits anywhere else. Caddy and nginx
 examples are in [docs/deployment.md](docs/deployment.md#behind-a-reverse-proxy).
 
 ## Building on it

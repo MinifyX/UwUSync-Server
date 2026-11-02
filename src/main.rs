@@ -352,6 +352,15 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
     maintenance(state.clone());
     updates::spawn(state.config.clone());
     tracing::info!(version = updates::build().version, "UwUSync Server");
+    let proxies = state.config.proxies();
+    if !proxies.is_empty() {
+        let list = proxies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(proxies = %list, "believing X-Forwarded-For from these proxies only");
+    }
     let legacy = uwusync_server::config::legacy_variables();
     if !legacy.is_empty() {
         tracing::info!(
