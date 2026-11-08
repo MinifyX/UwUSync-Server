@@ -339,6 +339,7 @@ running_image=$(docker inspect "$service" --format '{{.Image}}' 2>/dev/null)
 # move into .env; anything else somebody changed stops the update. A compose.yaml from before the
 # new name has them as UWUSSH_…, and they move in under their new names.
 lifted="UWUSYNC_PUBLIC UWUSYNC_REGISTRATION UWUSYNC_TLS UWUSYNC_TRUST_FORWARDED UWUSYNC_UPDATE_CHECK"
+lifted="$lifted UWUSYNC_TRUSTED_PROXIES"
 lifted="$lifted UWUSYNC_MAX_ACCOUNTS UWUSYNC_ACCOUNT_MAX_RECORDS UWUSYNC_ACCOUNT_MAX_MB"
 lifted="$lifted UWUSYNC_SERVER_MAX_MB UWUSYNC_MAX_CONNECTIONS UWUSYNC_MAX_CONNECTIONS_PER_IP"
 

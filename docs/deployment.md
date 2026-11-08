@@ -248,8 +248,18 @@ only — `--bind` may choose another port, not another address — and sets
 trust the certificate the usual way.
 
 `UWUSYNC_TRUST_FORWARDED=on` makes the rate limits count the address in
-`X-Forwarded-For` rather than the proxy's, and it takes the **last** one there,
-which is the one your proxy adds. Never switch it on for a server that is
+`X-Forwarded-For` rather than the proxy's. It counts only on requests that come
+from a trusted proxy, and it is read from the right: past every hop that is a
+trusted proxy itself, the first address that is none is the client's — the one
+your proxy adds. `X-Real-IP` is read only when there is no `X-Forwarded-For`.
+Which proxies are trusted, `UWUSYNC_TRUSTED_PROXIES` says: addresses or
+networks, separated by commas, like `192.0.2.10, 198.51.100.0/24`. Without it,
+loopback and the private networks count (`127.0.0.0/8`, `10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `::1`, `fc00::/7`) — a proxy on the same
+machine or in Docker next to it. A proxy on another public address needs its
+address named, and naming it narrows the list for devices in the same private
+network too, which otherwise could choose what they are counted under.
+Never switch it on for a server that is
 reachable without the proxy: anyone could then choose the address they are
 counted under. It also switches off the limit on connections from one address
 (`UWUSYNC_MAX_CONNECTIONS_PER_IP`), since every connection comes from the proxy;
