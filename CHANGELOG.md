@@ -3,8 +3,9 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
-## 0.4.1 (unreleased)
+## 0.4.1
 
+- Bundled SQLite 3.54.1 (rusqlite 0.41) against CVE-2026-119375 / RUSTSEC-2026-0459.
 - `/healthz` follows the suite format: besides `ok` and `schema` it answers with `status`,
   `version` and `checks.database`, and with 503 when the database does not respond.
 
