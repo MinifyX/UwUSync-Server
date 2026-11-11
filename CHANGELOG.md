@@ -6,6 +6,7 @@ release. Versions follow semver; `-beta.N` versions are pre-releases.
 ## 0.4.1
 
 - Bundled SQLite 3.54.1 (rusqlite 0.41) against CVE-2026-119375 / RUSTSEC-2026-0459.
+- Newer distroless base image with zlib 1.3.1-1+deb13u1 (CVE-2026-76844, CVE-2026-85091).
 - `/healthz` follows the suite format: besides `ok` and `schema` it answers with `status`,
   `version` and `checks.database`, and with 503 when the database does not respond.
 
