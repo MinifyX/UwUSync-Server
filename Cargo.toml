@@ -1,7 +1,7 @@
 [package]
 name = "uwusync-server"
 description = "Sync server for UwUSSH and UwURDP: an encrypted mailbox for hosts, keys and passwords"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/MinifyX/UwUSync-Server"
@@ -12,7 +12,7 @@ rust-version = "1.89"
 # The wire format, the clock and the conflict rule, straight from the client:
 # one definition, so client and server cannot drift apart. Pinned to a commit —
 # `cargo update -p uwussh-proto` after bumping this is a deliberate act.
-uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "388b1f2e269feb9f5daef615d4a505f043996c36" }
+uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "af4f3637ce2bdaa9c82401209e455a1c6c19170b" }
 
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -24,7 +24,7 @@ ed25519-dalek = "2"
 parking_lot = "0.12"
 rand = "0.8"
 # Bundled SQLite, so the server never depends on whichever libsqlite3 is around.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -63,9 +63,9 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # The real client, so one test can drive both halves of the protocol against
 # each other instead of trusting that they agree.
-uwussh-store = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "388b1f2e269feb9f5daef615d4a505f043996c36" }
-uwussh-sync = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "388b1f2e269feb9f5daef615d4a505f043996c36" }
-uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "388b1f2e269feb9f5daef615d4a505f043996c36" }
+uwussh-store = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "af4f3637ce2bdaa9c82401209e455a1c6c19170b" }
+uwussh-sync = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "af4f3637ce2bdaa9c82401209e455a1c6c19170b" }
+uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "af4f3637ce2bdaa9c82401209e455a1c6c19170b" }
 zeroize = "1.9.0"
 # Time that runs on by itself, for what waits half a minute.
 tokio = { version = "1", features = ["test-util"] }

@@ -14,7 +14,7 @@ use crate::db;
 use crate::limits;
 use crate::state::{client_key, AppState};
 use crate::{b64, ApiError, Result};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Request};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post, put};
@@ -155,15 +155,40 @@ pub fn prove_password(state: &AppState, auth: &Authenticated, key: &[u8]) -> Res
 struct Health {
     ok: bool,
     schema: u32,
+    status: &'static str,
+    version: &'static str,
+    checks: serde_json::Value,
 }
 
-/// Enough for a container health check and no more: whether it is alive and
-/// what it speaks. Never how many accounts it has.
-async fn health() -> Json<Health> {
-    Json(Health {
-        ok: true,
-        schema: uwussh_proto::SCHEMA_VERSION,
-    })
+/// Enough for a container health check and no more: whether it is alive,
+/// what it speaks, and whether the database answers (the suite `/healthz`
+/// format, 503 when it does not). Never how many accounts it has.
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
+    let up = state
+        .db
+        .lock()
+        .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+        .is_ok();
+    let (code, status, check) = if up {
+        (StatusCode::OK, "ok", serde_json::json!({"status": "ok"}))
+    } else {
+        tracing::warn!("health check: the database does not answer");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "down",
+            serde_json::json!({"status": "down", "message": "database does not answer"}),
+        )
+    };
+    (
+        code,
+        Json(Health {
+            ok: up,
+            schema: uwussh_proto::SCHEMA_VERSION,
+            status,
+            version: env!("CARGO_PKG_VERSION"),
+            checks: serde_json::json!({ "database": check }),
+        }),
+    )
 }
 
 /// A device as it enrols, and what it gets when it is let in — both from the
