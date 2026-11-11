@@ -1091,7 +1091,10 @@ async fn the_health_check_says_nothing_about_the_accounts() {
         .unwrap();
     assert_eq!(body["ok"], true);
     assert_eq!(body["schema"], SCHEMA_VERSION);
-    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["checks"]["database"]["status"], "ok");
+    assert_eq!(body.as_object().unwrap().len(), 5, "{body}");
 }
 
 #[tokio::test]
